@@ -114,25 +114,54 @@ public:
 
 ### 2.1 变长模板参数包（`Op<Derived, Traits...>`）
 
-MLIR 的具体算子类支持声明任意数量的 Traits（如 `MemRead`、`OneResult`、`Commutative`）。这是通过 C++11/C++17 的**变长模板参数包（Variadic Template Packs）**实现的：
+MLIR 的具体算子类支持声明任意数量的 Traits（如 `MemRead`、`OneResult`、`IsCommutative`）。这是通过 C++11/C++17 的**变长模板模板参数包（Variadic Template Template Packs）**与**折叠表达式**实现的：
 
 ```cpp
-// Traits... 表示 0 个或多个类型参数的打包
-template <typename ConcreteOp, typename... Traits>
-class Op : public OpView, public Traits... {
+namespace OpTrait {
+// 1. 声明 Trait 模板模具（接收 ConcreteOp 作为类型参数）
+template <typename ConcreteType>
+class MemRead {};
+
+template <typename ConcreteType>
+class OneResult {};
+
+template <typename ConcreteType>
+class IsCommutative {};
+} // namespace OpTrait
+
+// 2. 通用 Op 基类：使用变长模板模板参数 (template <typename> class... Traits)
+template <typename ConcreteOp, template <typename> class... Traits>
+class Op : public OpView, public Traits<ConcreteOp>... {
 public:
   using OpView::OpView;
 
   // 编译期谓词检查：当前 Op 是否具备某个特定 Trait
+  // 模板模板参数 (template <typename T> class Trait) 允许调用方仅传入模具名
   template <template <typename T> class Trait>
   static constexpr bool hasTrait() {
     // C++17 折叠表达式 (Fold Expression)：在编译期对所有 Traits 进行逻辑或展开
-    return (std::is_base_of_v<Trait<ConcreteOp>, Traits> || ...);
+    return (std::is_base_of_v<Trait<ConcreteOp>, Traits<ConcreteOp>> || ...);
   }
+};
+
+// 3. 具体派生算子：挂载所需 Traits（无需手动传 LoadOp 自身）
+class LoadOp : public Op<LoadOp, OpTrait::MemRead, OpTrait::OneResult> {
+public:
+  using Op::Op;
 };
 ```
 
-- **折叠表达式（Fold Expression: `(... || ...)`）**：C++17 引入的语法。编译器会在编译期将模板包展开为 `(is_base_of_v<T, Trait1> || is_base_of_v<T, Trait2> || ...)`，无需再编写繁琐的递归模板终止特化。
+#### 调用端与编译期展开效果
+
+```cpp
+// 编译期静态断言校验（0 运行时开销）
+static_assert(LoadOp::hasTrait<OpTrait::MemRead>(), "LoadOp should read memory");
+static_assert(LoadOp::hasTrait<OpTrait::OneResult>(), "LoadOp should have one result");
+static_assert(!LoadOp::hasTrait<OpTrait::IsCommutative>(), "LoadOp is not commutative");
+```
+
+- **模板模具自动组装**：调用方仅需写 `LoadOp::hasTrait<OpTrait::MemRead>()`，`Op` 基类内部自动将其与当前算子类型组合为 `OpTrait::MemRead<LoadOp>`；
+- **折叠表达式（Fold Expression: `(... || ...)`）**：在编译期展开为 `(is_base_of_v<Target, MemRead<LoadOp>> || is_base_of_v<Target, OneResult<LoadOp>>)`，直接计算出常量布尔值 `true` 或 `false`。
 
 ---
 
