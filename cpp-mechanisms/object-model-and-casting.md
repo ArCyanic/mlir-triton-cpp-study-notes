@@ -1,35 +1,35 @@
-# C++ 对象模型、LLVM Cast 体系与 MLIR 句柄架构：从内存拓扑到编译期分派
+# C++ 对象模型、LLVM Cast 体系与 MLIR 句柄架构
 
-> 本文以编译器中间表示（IR）中的典型节点——兼具通用调度与内存效果查询的 `LoadOp` 为统一贯穿用例，从 64 位内存字节排布、Itanium C++ ABI 虚表拓扑、汇编级 Thunk 调度出发，系统剖析标准 C++ 多态机制的底层物理本质；进而推导 LLVM 为何抛弃虚函数并开创基于 `SubclassID` 的静态标签分发体系（`isa/cast/dyn_cast`），以及 MLIR 为何进一步演进为解耦实体与视图的 Extensible Typed Wrapper（`OpView` + `TypeID`）架构。
+> 本文以编译器中间表示（IR）中的典型节点——兼具通用调度与内存效果查询的 `LoadOp` 为用例，从 64 位内存字节排布、Itanium C++ ABI 虚表拓扑出发，剖析标准 C++ 多态机制的底层开销；进而推导 LLVM 为何基于 `SubclassID` 构建静态标签分发体系（`isa/cast/dyn_cast`），以及 MLIR 为何进一步演进为解耦实体与视图的 Extensible Typed Wrapper（`OpView` + `TypeID`）架构。
 
 ---
 
 ## 目录
 
-- [1. 标准 C++ 对象的内存拓扑与 Itanium ABI 虚表分派](#1-标准-c-对象的内存拓扑与-itanium-abi-虚表分派)
+- [1. 标准 C++ 对象的内存排布与 Itanium ABI 虚表分派](#1-标准-c-对象的内存排布与-itanium-abi-虚表分派)
   - [1.1 贯穿场景建模：多接口 IR 加载节点 `LoadOp`](#11-贯穿场景建模多接口-ir-加载节点-loadop)
-  - [1.2 64 位物理内存排布（Byte 0 到 39 拓扑图）](#12-64-位物理内存排布byte-0-到-39-拓扑图)
+  - [1.2 64 位内存排布（0x00 到 0x27 拓扑）](#12-64-位内存排布0x00-到-0x27-拓扑)
   - [1.3 虚表内部结构：`offset-to-top`、RTTI 描述符与槽位](#13-虚表内部结构offset-to-toprtti-描述符与槽位)
   - [1.4 指针转换与 Thunk 机制：静态偏移修正 vs `dynamic_cast` 寻路](#14-指针转换与-thunk-机制静态偏移修正-vs-dynamic_cast-寻路)
-- [2. 编译器的转折点：为什么 LLVM/MLIR 全面抛弃标准 C++ 多态？](#2-编译器的转折点为什么-llvmmlir-全面抛弃标准-c-多态)
-  - [2.1 内存与 Cache 灾难：元数据膨胀与缓存失效](#21-内存与-cache-灾难元数据膨胀与缓存失效)
-  - [2.2 间接寻址与内联阻碍：虚函数调用的性能黑洞](#22-间接寻址与内联阻碍虚函数调用的性能黑洞)
-  - [2.3 动态库符号陷阱与全局 `-fno-rtti` 决策](#23-动态库符号陷阱与全局--fno-rtti-决策)
-- [3. LLVM 的解法：基于 `SubclassID` 的静态判别多态与 `classof`](#3-llvm-的解法基于-subclassid-的静态判别多态与-classof)
-  - [3.1 零虚表（Zero-VTable）架构：`llvm::Value` 的 1 字节标签](#31-零虚表zero-vtable架构llvmvalue-的-1-字节标签)
-  - [3.2 `classof` 契约与连续区间编码优化](#32-classof-契约与连续区间编码优化)
-  - [3.3 现代 LLVM Cast 体系的核心分发流水线（`isa/cast/dyn_cast`）](#33-现代-llvm-cast-体系的核心分发流水线isacastdyn_cast)
-- [4. MLIR 的解法：Extensible Handle-Body 架构与 `TypeID` 唯一化](#4-mlir-的解法extensible-handle-body-架构与-typeid-唯一化)
-  - [4.1 核心矛盾：为什么 LLVM 继承树在 MLIR 中失效？](#41-核心矛盾为什么-llvm-继承树在-mlir-中失效)
-  - [4.2 终极解耦：`Operation` 实体与 8 字节轻量句柄（`OpView`）](#42-终极解耦operation-实体与-8-字节轻量句柄opview)
-  - [4.3 `TypeID` 机制与 `AbstractOperation` 接口分发](#43-typeid-机制与-abstractoperation-接口分发)
-- [5. 跨体系全景对照与编译器源码调试决策树](#5-跨体系全景对照与编译器源码调试决策树)
-  - [5.1 三代类型多态体系终极物理矩阵表](#51-三代类型多态体系终极物理矩阵表)
+- [2. 为什么 LLVM 与 MLIR 不采用 C++ 原生多态？](#2-为什么-llvm-与-mlir-不采用-c-原生多态)
+  - [2.1 虚表与 RTTI 的内存与缓存开销](#21-虚表与-rtti-的内存与缓存开销)
+  - [2.2 间接调用的性能影响与内联阻碍](#22-间接调用的性能影响与内联阻碍)
+  - [2.3 动态库符号可见性与 `-fno-rtti`](#23-动态库符号可见性与--fno-rtti)
+- [3. LLVM 标签多态体系：`SubclassID` 与 `classof`](#3-llvm-标签多态体系subclassid-与-classof)
+  - [3.1 零虚表设计：`llvm::Value` 的 1 字节标签](#31-零虚表设计llvmvalue-的-1-字节标签)
+  - [3.2 `classof` 契约与连续枚举区间优化](#32-classof-契约与连续枚举区间优化)
+  - [3.3 LLVM Cast 体系分发流水线（`isa/cast/dyn_cast`）](#33-llvm-cast-体系分发流水线isacastdyn_cast)
+- [4. MLIR 的 Extensible Handle-Body 架构与 `TypeID`](#4-mlir-的-extensible-handle-body-架构与-typeid)
+  - [4.1 为什么封闭式枚举继承树在 MLIR 中不再适用？](#41-为什么封闭式枚举继承树在-mlir-中不再适用)
+  - [4.2 实体与视图解耦：`Operation` 实体与 8 字节句柄（`OpView`）](#42-实体与视图解耦operation-实体与-8-字节句柄opview)
+  - [4.3 `TypeID` 机制与 `AbstractOperation` 概念分发](#43-typeid-机制与-abstractoperation-概念分发)
+- [5. 多态体系对比与类型转换决策树](#5-多态体系对比与类型转换决策树)
+  - [5.1 三种多态体系特性对比表](#51-三种多态体系特性对比表)
   - [5.2 编译器源码阅读与类型转换决策树](#52-编译器源码阅读与类型转换决策树)
 
 ---
 
-## 1. 标准 C++ 对象的内存拓扑与 Itanium ABI 虚表分派
+## 1. 标准 C++ 对象的内存排布与 Itanium ABI 虚表分派
 
 ### 1.1 贯穿场景建模：多接口 IR 加载节点 `LoadOp`
 
@@ -223,15 +223,15 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-## 2. 编译器的转折点：为什么 LLVM/MLIR 全面抛弃标准 C++ 多态？
+## 2. 为什么 LLVM 与 MLIR 不采用 C++ 原生多态？
 
-### 2.1 内存与 Cache 灾难：元数据膨胀与缓存失效
+### 2.1 虚表与 RTTI 的内存与缓存开销
 
-在工业级编译器（如编译 PyTorch、Linux 内核或大型深度学习模型）中，IR 图包含的节点数量通常在 $10^5 \sim 10^7$（十万到千万）量级。
+在编译器（如编译 PyTorch、Linux 内核或大型深度学习模型）中，IR 图包含的节点数量通常在 $10^5 \sim 10^7$ 量级。
 
 若采用上述标准 C++ 多继承模型：
 - **元数据占比过高**：每个 `LoadOp` 占用 **40 字节**，其中 2 个 `vptr`（16B）加上对齐填充（11B）消耗了 **27 字节的纯元数据开销**，真正承载业务的字段（`opcode` 4B + `reads` 1B + `address` 8B = 13B）占比仅为 32.5%；
-- **CPU 缓存爆仓（Cache Thrashing）**：编译器 Pass 的主要瓶颈在于遍历 IR 时的内存带宽。当 IR 节点的有效数据被大量无用的虚表指针稀释时，CPU 的 L1/L2 Data Cache 频繁被这些指针占满，导致极高的 Cache Miss 惩罚。
+- **CPU 缓存利用率下降**：编译器 Pass 的主要瓶颈往往在于遍历 IR 时的内存带宽。当 IR 节点的有效数据被大量虚表指针稀释时，CPU 的 L1/L2 Data Cache 频繁被这些指针占满，导致更高的 Cache Miss 开销。
 
 ```
 标准 C++ LoadOp (40B)    [ 8B vptr1 ][ 4B opcode ][ 4B pad ][ 8B vptr2 ][ 1B ][ 7B pad ][ 8B addr ]
@@ -240,34 +240,34 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-### 2.2 间接寻址与内联阻碍：虚函数调用的性能黑洞
+### 2.2 间接调用的性能影响与内联阻碍
 
 1. **分支预测惩罚（Indirect Branch Penalty）**：
    - 虚函数分派通过寄存器间接跳转（`call *%rax`）。
-   - 在编译遍历循环中，前一条指令可能是 `LoadOp`，后一条可能是 `StoreOp` 或 `AddOp`。多态指针类型的频繁交替导致 CPU 的**分支目标缓冲器（BTB / Branch Target Buffer）**预测命中率大幅下降，引发 CPU 流水线反复清空与停顿。
-2. **内联壁垒（The Inlining Barrier）**：
-   - 现代编译器最核心的优化武器是**函数内联（Inlining）**——只有将小函数的代码展开到调用点，才能进一步触发常量折叠、死代码消除和死循环外提。
-   - 虚函数在编译期由于动态目标未知，无法直接内联（除非极受限的 Devirtualization 场景），将整个优化流水线生生截断在接口边界之外。
+   - 在遍历循环中，多态指针类型的频繁交替导致 CPU 的**分支目标缓冲器（BTB）**预测命中率下降，引发流水线停顿。
+2. **内联受阻（The Inlining Barrier）**：
+   - 编译器的核心优化之一是**函数内联（Inlining）**——只有将小函数展开到调用点，才能进一步触发常量折叠、死代码消除等分析。
+   - 虚函数在编译期由于动态目标未定，通常无法直接内联，限制了后续优化。
 
 ---
 
-### 2.3 动态库符号陷阱与全局 `-fno-rtti` 决策
+### 2.3 动态库符号可见性与 `-fno-rtti`
 
-现代编译器基础设施（如 LLVM、Clang、MLIR、Triton）普遍由数十个动态共享库（DSO，如 `libLLVM.so`、`libMLIR.dylib`）以及动态加载的后端插件组成。
+现代编译器基础设施（如 LLVM、Clang、MLIR、Triton）普遍由动态共享库（DSO）以及动态加载的后端插件组成。
 
-- **跨 DSO 的 `std::type_info` 副本灾难**：
+- **跨 DSO 的 `std::type_info` 副本问题**：
   - 根据 Itanium C++ ABI，当两个独立的动态库各自编译了同一个类定义时，各自的 `.so` 内部都会生成一份 `typeid` 描述符。
-  - 跨动态库传递指针时，简单的指针地址对比 `&typeid(*op) == &typeid(LoadOp)` 判定为不相等；标准库的 `dynamic_cast` 必须被迫退化为**调用 `strcmp(typeinfo->name)` 进行慢速字符串比较**。
-- **全局构建指令：`-fno-rtti`**：
-  - LLVM 官方在全项目工程规范中强制开启 `-fno-rtti`，不仅直接将最终编译器二进制体积缩减 10%~20%，彻底杜绝 RTTI 字符串比较的性能隐患，更倒逼设计出了一套**完全由编译器掌控的静态标签类型体系**。
+  - 跨动态库传递指针时，地址对比 `&typeid(*op) == &typeid(LoadOp)` 可能判定为不相等；标准库的 `dynamic_cast` 被迫退化为**调用 `strcmp(typeinfo->name)` 进行慢速字符串比较**。
+- **全局配置：`-fno-rtti`**：
+  - LLVM 官方在全项目中强制开启 `-fno-rtti`，不仅缩减最终二进制体积，杜绝 RTTI 字符串比较的性能隐患，更驱动设计出了一套**静态标签类型体系**。
 
 ---
 
-## 3. LLVM 的解法：基于 `SubclassID` 的静态判别多态与 `classof`
+## 3. LLVM 标签多态体系：`SubclassID` 与 `classof`
 
-### 3.1 零虚表（Zero-VTable）架构：`llvm::Value` 的 1 字节标签
+### 3.1 零虚表设计：`llvm::Value` 的 1 字节标签
 
-LLVM 的设计哲学是：**保留真实的 C++ 类继承树，但彻底拔除所有的 `virtual` 关键字与虚指针**。
+LLVM 的核心设计是：**保留 C++ 类继承体系，但移除 `virtual` 关键字与虚函数表**。
 
 作为整个 LLVM IR 继承体系根节点的 `llvm::Value`，其核心类骨架设计如下：
 
@@ -385,7 +385,7 @@ setbe   %al                   ; 0 周期内完成判定
 
 ---
 
-### 3.3 现代 LLVM Cast 体系的核心分发流水线（`isa/cast/dyn_cast`）
+### 3.3 LLVM Cast 体系分发流水线（`isa/cast/dyn_cast`）
 
 基于 `classof` 静态契约，LLVM 构建了现代化的模板分发流水线。在底层，所有公共接口统一委托给模板适配器 `llvm::CastInfo<To, From>`：
 
@@ -437,21 +437,21 @@ void processInstruction(llvm::Instruction *inst) {
 }
 ```
 
-#### 标准 C++ `dynamic_cast` vs LLVM `dyn_cast` 终极对比
+#### 标准 C++ `dynamic_cast` vs LLVM `dyn_cast` 对比
 
 | 机制维度 | 标准 C++ `dynamic_cast<T*>` | LLVM `llvm::dyn_cast<T*>` |
 | :--- | :--- | :--- |
 | **运行时类型存储** | 每个对象携带 8B `vptr` $\rightarrow$ 虚表 $\rightarrow$ `type_info` | 仅基类携带 **1 字节 `SubclassID`** |
 | **类型判别算法** | 递归遍历 RTTI 继承图（跨 DSO 退化为 `strcmp`） | **$O(1)$ 静态 `classof` 枚举区间单指令比较** |
 | **可内联性** | ❌ 外部运行时函数调用（`__dynamic_cast`），不可内联 | ✅ **100% 编译期模板完全内联展开** |
-| **内存开销** | 极高（每个虚基类引入 8B 指针与 Padding） | **0 额外内存开销**（零虚表） |
+| **内存开销** | 较高（虚基类引入指针与 Padding） | **0 额外内存开销**（零虚表） |
 | **工程配置依赖** | 强依赖编译器默认 RTTI 支持 | **完全兼容 `-fno-rtti`**（编译器首选） |
 
 ---
 
-## 4. MLIR 的解法：Extensible Handle-Body 架构与 `TypeID` 唯一化
+## 4. MLIR 的 Extensible Handle-Body 架构与 `TypeID`
 
-### 4.1 核心矛盾：为什么 LLVM 继承树在 MLIR 中失效？
+### 4.1 为什么封闭式枚举继承树在 MLIR 中不再适用？
 
 LLVM 的 `SubclassID` 方案完美解决了封闭世界（Closed World）下的性能与内存问题。但当编译技术演进到多方言嵌套、动态插件化的 **MLIR 时代** 时，这一方案遇到了根本性的架构瓶颈：
 
@@ -473,7 +473,7 @@ LLVM 模式 (封闭继承树)                   MLIR 模式 (无限方言插件�
 
 ---
 
-### 4.2 终极解耦：`Operation` 实体与 8 字节轻量句柄（`OpView`）
+### 4.2 实体与视图解耦：`Operation` 实体与 8 字节句柄（`OpView`）
 
 在 MLIR 中，内存中的真实对象与开发者在 C++ 中操作的类型接口被彻底划分为两个正交的维度：
 
@@ -490,23 +490,23 @@ LLVM 模式 (封闭继承树)                   MLIR 模式 (无限方言插件�
                                        │ 内部保存单一指针 (sizeof == 8 Bytes)
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. 栈上无开销强类型句柄 (Typed Wrapper): class triton::LoadOp              │
+│ 2. 栈上轻量强类型句柄 (Typed Wrapper): class triton::LoadOp                 │
 │    - 继承链: LoadOp -> Op<LoadOp, OpTrait::MemRead, ...> -> OpView          │
 │    - 内部成员: 仅有一个 Operation *state 指针                               │
-│    - 核心契约: Defines NO class fields (零自有字段，按值传递 Pass-by-Value) │
+│    - 核心契约: 零自有字段，按值传递 (Pass-by-Value)                         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### 零字段 Typed Wrapper 核心实现
 
-由 TableGen（ODS）生成的具体算子类（如 `LoadOp`）本质上只是一个**强类型的智能指针外壳**：
+由 TableGen（ODS）生成的具体算子类（如 `LoadOp`）本质上是一个**强类型的智能指针外壳**：
 
 ```cpp
 namespace mlir {
 // 1. 所有 Typed Wrapper 的公共基类
 class OpView {
 protected:
-  Operation *state; // 整个继承链中唯一的成员变量！
+  Operation *state; // 整个继承链中唯一的成员变量
 
 public:
   Operation *getOperation() const { return state; }
@@ -534,13 +534,13 @@ public:
 
 ---
 
-### 4.3 `TypeID` 机制与 `AbstractOperation` 接口分发
+### 4.3 `TypeID` 机制与 `AbstractOperation` 概念分发
 
 既然没有任何 C++ 物理继承和硬编码枚举，MLIR 是如何在运行时实现 $O(1)$ 的类型转换（`dyn_cast<LoadOp>(Operation*)`）以及接口查询（`dyn_cast<MemoryEffectOpInterface>(op)`）的？
 
 答案是：**`TypeID` 进程级内存地址唯一化 + `AbstractOperation` 单例注册表**。
 
-#### 1. `TypeID` 的底层物理本质：静态变量地址
+#### 1. `TypeID` 实现原理：静态变量地址
 
 MLIR 的 `TypeID` 机制巧妙利用了 C++ 标准的一项核心保证：**每个模板实例化在进程内部拥有全局唯一的静态局部变量地址**。
 
@@ -550,7 +550,7 @@ class TypeID {
 public:
   template <typename T>
   static TypeID get() {
-    // C++ 保证：无论何时调用 TypeID::get<T>()，&id 的内存地址恒定且唯一！
+    // 静态局部变量拥有全局唯一内存地址
     static const char id = 0;
     return TypeID(&id);
   }
@@ -564,7 +564,7 @@ private:
 }
 ```
 
-- **零哈希、零字符串比较**：判断两个类型是否相同，只需对比两个指针地址 `&id1 == &id2`，执行开销严格为 **1 个 CPU 周期**！
+- **单周期比对**：判断两个类型是否相同，只需对比两个指针地址 `&id1 == &id2`，执行开销为单指令指针比对。
 
 #### 2. `AbstractOperation` 注册表与 $O(1)$ 接口分发
 
@@ -589,7 +589,7 @@ mlir::Operation *op
 ```
 
 ```cpp
-// MLIR 中算子与接口模式匹配的优雅写法
+// MLIR 中算子与接口模式匹配的写法
 void analyzeOperation(mlir::Operation *op) {
   // 1. 具体算子转换 (包装同一 Operation*)
   if (auto load = mlir::dyn_cast<triton::LoadOp>(op)) {
@@ -607,52 +607,50 @@ void analyzeOperation(mlir::Operation *op) {
 
 ---
 
-## 5. 跨体系全景对照与编译器源码调试决策树
+## 5. 多态体系对比与类型转换决策树
 
-### 5.1 三代类型多态体系终极物理矩阵表
+### 5.1 三种多态体系特性对比表
 
 | 机制维度 | 1. 标准 C++ 多继承（Itanium ABI） | 2. LLVM 静态标签继承树 | 3. MLIR Extensible Handle-Body |
 | :--- | :--- | :--- | :--- |
-| **物理实体载体** | 多继承派生类独立物理对象 | 真实派生类物理对象（无虚函数） | 单一通用 `mlir::Operation` 结构体 |
-| **对象句柄类型** | 真实派生类指针/引用（带 $\Delta$ 偏移） | 真实派生类指针（单继承 0 偏移） | 8 字节轻量栈包装句柄（`OpView`） |
+| **数据载体** | 独立派生类对象 | 真实派生类对象（无虚函数） | 通用 `mlir::Operation` 结构体 |
+| **句柄类型** | 派生类指针/引用（带偏移） | 派生类指针（单继承 0 偏移） | 8 字节轻量栈包装句柄（`OpView`） |
 | **运行时类型标识** | 虚表指针（`vptr`） $\rightarrow$ `std::type_info` | 头部 1 字节 `SubclassID` 枚举 | 静态变量指针 `TypeID` + `AbstractOperation` |
-| **单对象内存开销** | 极高（16B+ 虚指针与 Padding） | **极低（1 字节标签嵌入头部）** | **全局统一平铺（零类字段冗余）** |
-| **分发与转换机制** | 查虚表 + `dynamic_cast` 继承图深搜 | `classof` 静态枚举区间单指令比对 | `TypeID` 地址比对 + Concept Map 查表 |
-| **生态扩展性** | 封闭（需提前定义完整继承树） | 封闭（需在中心枚举中预留区段） | **无限开放（支持动态 Dialect 插件化扩展）** |
-| **`-fno-rtti` 兼容** | ❌ 强依赖 RTTI | ✅ **100% 静态内联，完全兼容** | ✅ **100% 静态内联，完全兼容** |
+| **单对象额外开销** | 较高（虚指针与 Padding） | **极低（1 字节标签嵌入头部）** | **统一平铺（零类字段冗余）** |
+| **分发与转换机制** | 查虚表 + `dynamic_cast` 继承图搜索 | `classof` 静态枚举区间比较 | `TypeID` 地址比对 + Concept Map 查表 |
+| **生态扩展性** | 封闭（需提前定义完整继承树） | 封闭（需在中心枚举中预留区段） | **开放（支持动态 Dialect 插件化扩展）** |
+| **`-fno-rtti` 兼容** | ❌ 依赖 RTTI | ✅ **完全兼容** | ✅ **完全兼容** |
 
 ---
 
 ### 5.2 编译器源码阅读与类型转换决策树
 
-当你在阅读 LLVM / MLIR / Triton 编译器源码看到类型转换时，可依循以下决策路径迅速建立底层物理直觉：
-
 ```
-                    编译器源码阅读与类型转换物理因果链
+                    编译器源码阅读与类型转换因果路径
                                   遇到类型转换代码
                                          │
                  ┌───────────────────────┴───────────────────────┐
                  ▼                                               ▼
-      【LLVM 代码: isa / cast<T>(val)】              【MLIR 代码: dyn_cast<T>(op)】
+       【LLVM 代码: isa / cast<T>(val)】              【MLIR 代码: dyn_cast<T>(op)】
                  │                                               │
-  1. 识别源对象与目标类型:                        1. 识别源对象与目标类型:
-     - 源对象是真实的 C++ 派生类指针                  - op 是通用的 Operation*
-     - 目标类型 T 是真实的 C++ 派生类                 - 目标 T 是 8 字节栈句柄 (OpView)
+   1. 识别源对象与目标类型:                        1. 识别源对象与目标类型:
+      - 源对象是真实的 C++ 派生类指针                  - op 是通用的 Operation*
+      - 目标类型 T 是真实的 C++ 派生类                 - 目标 T 是 8 字节栈句柄 (OpView)
                  │                                               │
-  2. 底层发生的事情:                              2. 底层发生的事情:
-     - 编译器内联执行 T::classof(val)                - 提取 op->getName().getTypeID()
-     - 读取 val 头部 1 字节 SubclassID               - 与 TypeID::get<T>() 执行单周期指针比对
-     - 执行汇编级连续区间范围判定                    - 命中后在栈上构造并返回 T(op) 临时句柄
+   2. 底层发生的事情:                              2. 底层发生的事情:
+      - 编译器内联执行 T::classof(val)                - 提取 op->getName().getTypeID()
+      - 读取 val 头部 1 字节 SubclassID               - 与 TypeID::get<T>() 执行单周期指针比对
+      - 执行连续区间范围判定                          - 命中后在栈上构造并返回 T(op) 临时句柄
                  │                                               │
                  ▼                                               ▼
-  【物理结论】: 指针数值不变，                    【物理结论】: 堆上实体未动，
-  仅在静态编译期赋予更具体的派生类 API 权限。     在栈上赋予 8 字节轻量语义视图。
+   【结论】: 指针数值不变，                        【结论】: 堆上实体未动，
+   仅在静态编译期赋予更具体的派生类 API 权限。     在栈上赋予 8 字节轻量语义视图。
 ```
 
 > [!TIP]
-> **终极心智模型总结**：
-> - **C++ 经典面向对象**：*以类为本位*，数据与方法紧耦合，依靠虚表指针实现动态多态，代价是高昂的内存与间接寻址开销；
-> - **LLVM 体系**：*以静态性能为本位*，保留继承但拔除虚表，依靠 1 字节静态枚举标签与 `classof` 实现极致内联与零开销转换；
-> - **MLIR 体系**：*以生态扩展为本位*，彻底拆分实体（`Operation`）与接口句柄（`OpView`），依靠 8 字节 `TypeID` 内存地址比对实现无限方言插件化。
+> **核心技术选型对比**：
+> - **C++ 经典面向对象**：*以类为本位*，数据与方法紧耦合，依靠虚表指针实现动态多态，代价是虚指针开销与间接调用；
+> - **LLVM 体系**：*以编译期吞吐为本位*，保留继承但移除虚表，依靠 1 字节静态枚举标签与 `classof` 实现静态内联与高效转换；
+> - **MLIR 体系**：*以生态扩展为本位*，彻底拆分实体（`Operation`）与接口句柄（`OpView`），依靠 8 字节 `TypeID` 内存地址比对实现多方言扩展。
 
 

@@ -896,7 +896,7 @@ getOperation() 返回的根节点 (ModuleOp)
 | API | 行为特征 | 适用场景 |
 | :--- | :--- | :--- |
 | **`applyPartialConversion`** | **部分转换**：允许 IR 中保留未转换的合法算子，只要所有被标记为 Illegal 的算子都成功降级即可。若有 Illegal 残留则返回失败。 | **最常用的分阶段 Pass 降级入口**（如 Toy 逐步降级到 Affine/MemRef）。 |
-| **`applyFullConversion`** | **完全转换**：极其严格。转换结束后，整个 IR 树中绝对不能留有任何旧 Dialect 的算子，否则宣告失败。 | 面向 LLVM IR 或目标硬件方言的终极代码生成阶段。 |
+| **`applyFullConversion`** | **完全转换**：极其严格。转换结束后，整个 IR 树中绝对不能留有任何旧 Dialect 的算子，否则宣告失败。 | 面向 LLVM IR 或目标硬件方言的最终代码生成阶段。 |
 | **`applyAnalysisConversion`** | **仅分析不改写**：只试探性执行匹配流程，检查 IR 是否能够被成功转换，不实际修改 IR 结构。 | 用于 Pass 内部的分析与条件决策。 |
 
 ---
