@@ -8,7 +8,7 @@
 
 - [1. 值类别、传参机制与生命周期](#1-值类别传参机制与生命周期)
   - [1.1 五大值类别划分（Identity vs Movability）](#11-五大值类别划分identity-vs-movability)
-  - [1.2 形参空间正交分解与 $5 \times 6$ 绑定矩阵](#12-形参空间正交分解与-5-times-6-绑定矩阵)
+  - [1.2 形参正交分解与 5×6 绑定矩阵](#12-形参正交分解与-56-绑定矩阵)
   - [1.3 Sink Parameter 传值 + `std::move` 模式](#13-sink-parameter-传值--stdmove-模式)
   - [1.4 `std::move` 本质与 `const` 移动退化](#14-stdmove-本质与-const-移动退化)
   - [1.5 返回值优化（RVO/NRVO）与 `return std::move` 反优化](#15-返回值优化rvonrvo与-return-stdmove-反优化)
@@ -69,7 +69,7 @@
   * `decltype(x)` 产生变量的声明类型；`decltype((x))`（带双括号）产生表达式的值类别引用类型（左值产生 `T&`）。
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 2 章](value-categories-and-parameter-passing.md#2-表达式与值类别体系)
 
-### 1.2 形参空间正交分解与 $5 \times 6$ 绑定矩阵
+### 1.2 形参正交分解与 5×6 绑定矩阵
 
 ```text
                  维度二：引用修饰 (Ref-qualifier)
@@ -95,7 +95,7 @@
   2. **意图契约**：`&` 专绑活体左值（可写）；`&&` 专绑将亡右值（窃取所有权）；
   3. **标准救生圈**：`const T&` 允许绑定右值并延长生命周期；
   4. **反模式**：`const T&&` 既要右值又不准修改，导致退化深拷贝，现实中仅用于 `= delete` 禁用右值入参。
-* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3 章](value-categories-and-parameter-passing.md#3-形参正交空间与-56-绑定矩阵)
+* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3 章](value-categories-and-parameter-passing.md#3-形参空间与绑定矩阵)
 
 ---
 
@@ -115,7 +115,7 @@
 * **分流路径与开销分析**：
   * **实参传左值**（`Node(name_var, op_var)`）：形参触发 1 次深拷贝构造，初始化列表触发 1 次移动构造 $\implies$ **共 1 Copy + 1 Move**（保全调用方原数据）；
   * **实参传右值/临时对象**（`Node("Add", {1, 2})`）：形参触发 1 次移动构造，初始化列表触发 1 次移动构造 $\implies$ **共 0 Copy + 2 Move**（全生命周期 0 堆内存分配）。
-* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3.5 节](value-categories-and-parameter-passing.md#35-典型传参模式与-sink-parameter-模式)
+* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3.5 节](value-categories-and-parameter-passing.md#35-传参范式与-sink-模式)
 
 ---
 
@@ -135,7 +135,7 @@
   std::vector<int> v2 = std::move(v); // 💥 静默退化为全量深拷贝！
   ```
   * **机理**：`std::move(const)` 产生 `const std::vector<int>&&`，因带 `const` 无法绑定非常量 `vector(vector&&)`，编译器自动退回调用拷贝构造 `vector(const vector&)`。
-* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 4 章](value-categories-and-parameter-passing.md#4-移动语义原理与类型系统退化)
+* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 4 章](value-categories-and-parameter-passing.md#4-移动语义与类型退化)
 
 ---
 
@@ -151,7 +151,7 @@
   }
   ```
   * **机理**：显式写 `std::move` 将具名左值强转为右值引用表达式，编译器被迫放弃 0 开销的 NRVO 栈地址合并，退化去执行 1 次移动构造函数。
-* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 5 章](value-categories-and-parameter-passing.md#5-拷贝消除与返回值优化rvonrvo)
+* **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 5 章](value-categories-and-parameter-passing.md#5-拷贝消除与返回值优化)
 
 ---
 
