@@ -7,24 +7,24 @@
 ## 目录
 
 - [1. CRTP 模式与静态分派](#1-crtp-模式与静态分派)
-  - [1.1 为什么编译器基础设施重度依赖 CRTP？](#11-为什么编译器基础设施重度依赖-crtp)
-  - [1.2 虚函数动态分派 vs CRTP 静态分派对比](#12-虚函数动态分派-vs-crtp-静态分派对比)
-- [2. 不完整类型与延迟实例化时序](#2-不完整类型与延迟实例化时序)
-  - [2.1 编译期四阶段时序解析](#21-编译期四阶段时序解析)
-  - [2.2 CRTP 内存布局安全边界：成员变量 vs 成员函数体](#22-crtp-内存布局安全边界成员变量-vs-成员函数体)
-- [3. `PassWrapper<PassT, BaseT>` 基础设施的实现机制](#3-passwrapperpasst-baset-基础设施的实现机制)
-  - [3.1 `PassT` 的四重类型信息流向（TypeID/Name/classof/clone）](#31-passt-的四重类型信息流向typeidnameclassofclone)
-  - [3.2 `clonePass()` 中的 `static_cast` 静态转换](#32-clonepass-中的-static_cast-静态转换)
-  - [3.3 `BaseT` 的 IR 调度根约束（`OperationPass<ModuleOp>`）](#33-baset-的-ir-调度根约束operationpassmoduleop)
-- [4. TableGen 生成基类中的 CRTP 应用](#4-tablegen-生成基类中的-crtp-应用)
-  - [4.1 手写 `PassWrapper` vs TableGen 自动生成的 `...Base<DerivedT>`](#41-手写-passwrapper-vs-tablegen-自动生成的-basederivedt)
-  - [4.2 声明式 `.td` 选项解析与 CRTP 派生类实现](#42-声明式-td-选项解析与-crtp-派生类实现)
+  - [1.1 派生类类型捕获](#11-派生类类型捕获)
+  - [1.2 虚函数分派 vs CRTP 静态分派](#12-虚函数分派-vs-crtp-静态分派)
+- [2. 不完整类型与延迟实例化](#2-不完整类型与延迟实例化)
+  - [2.1 编译期四阶段时序](#21-编译期四阶段时序)
+  - [2.2 CRTP 内存布局安全边界](#22-crtp-内存布局安全边界)
+- [3. PassWrapper 基础设施实现](#3-passwrapper-基础设施实现)
+  - [3.1 PassT 四重信息流向](#31-passt-四重信息流向)
+  - [3.2 clonePass 与 static_cast](#32-clonepass-与-static_cast)
+  - [3.3 BaseT 调度根约束](#33-baset-调度根约束)
+- [4. TableGen 生成基类与 CRTP](#4-tablegen-生成基类与-crtp)
+  - [4.1 PassWrapper vs TableGen 生成基类](#41-passwrapper-vs-tablegen-生成基类)
+  - [4.2 声明式选项与派生实现](#42-声明式选项与派生实现)
 
 ---
 
 ## 1. CRTP 模式与静态分派
 
-### 1.1 为什么编译器基础设施重度依赖 CRTP？
+### 1.1 派生类类型捕获
 
 在 MLIR 与 Triton 框架中，我们经常看到形如 `class Derived : public Base<Derived>` 的继承定义：
 
@@ -39,7 +39,7 @@ struct VerifyWarpSpecializationPartitions
 };
 ```
 
-#### 核心痛点：通用基类缺少派生类的具体身份
+#### 通用基类缺少派生类的具体身份
 
 在面向对象设计中，通用基类（如 `PassWrapper` 或 `Op`）需要提供通用算法实现（如对象克隆、名称查询、RTTI 替代判别等），但这些算法的具体执行**强依赖于最终派生类的具体 C++ 类型**：
 - `clonePass()` 必须调用具体派生类的拷贝构造函数 `new PassT(*this)`；
@@ -50,7 +50,7 @@ struct VerifyWarpSpecializationPartitions
 
 ---
 
-### 1.2 虚函数动态分派 vs CRTP 静态分派对比
+### 1.2 虚函数分派 vs CRTP 静态分派
 
 ```
            虚函数动态多态 vs CRTP 编译期静态分派模型
@@ -70,9 +70,9 @@ Base<Derived> ──► 编译期 static_cast<Derived*>(this) ──► 直接�
 
 ---
 
-## 2. 不完整类型与延迟实例化时序
+## 2. 不完整类型与延迟实例化
 
-### 2.1 编译期四阶段时序解析
+### 2.1 编译期四阶段时序
 
 初学 CRTP 时，常见的疑问是：
 > “当编译器读到 `struct VerifyPartitions : PassWrapper<VerifyPartitions>` 时，`VerifyPartitions` 还没定义完，为什么能当作模板参数传给基类？”
@@ -103,7 +103,7 @@ C++ 标准规定：**类在声明其基类列表时，自身处于不完整类�
 
 ---
 
-### 2.2 CRTP 内存布局安全边界：成员变量 vs 成员函数体
+### 2.2 CRTP 内存布局安全边界
 
 理解延迟实例化时序，有助于明确 CRTP 基类中哪些操作是合法的：
 
@@ -128,9 +128,9 @@ class SafeBase {
 
 ---
 
-## 3. `PassWrapper<PassT, BaseT>` 基础设施的实现机制
+## 3. PassWrapper 基础设施实现
 
-### 3.1 `PassT` 的四重类型信息流向（TypeID/Name/classof/clone）
+### 3.1 PassT 四重信息流向
 
 MLIR 的 `PassWrapper<PassT, BaseT>` 模板骨架通过一个 `PassT` 模板参数，自动生成了 Pass 运行所需的 4 大关键机制：
 
@@ -178,7 +178,7 @@ BaseT(TypeID::   getName() { return      classof(pass) {   clonePass() {
 
 ---
 
-### 3.2 `clonePass()` 中的 `static_cast` 静态转换
+### 3.2 clonePass 与 static_cast
 
 在 `clonePass()` 中，核心转换语句是：
 
@@ -195,7 +195,7 @@ return std::make_unique<PassT>(*concretePass);
 
 ---
 
-### 3.3 `BaseT` 的 IR 调度根约束（`OperationPass<ModuleOp>`）
+### 3.3 BaseT 调度根约束
 
 `PassWrapper` 的第二个模板参数 `BaseT` 承担了 **Pass 调度根约束**：
 
@@ -219,9 +219,9 @@ struct MyFuncPass : PassWrapper<MyFuncPass, OperationPass<func::FuncOp>> {
 
 ---
 
-## 4. TableGen 生成基类中的 CRTP 应用
+## 4. TableGen 生成基类与 CRTP
 
-### 4.1 手写 `PassWrapper` vs TableGen 自动生成的 `...Base<DerivedT>`
+### 4.1 PassWrapper vs TableGen 生成基类
 
 在大型生产级项目（如 Triton）中，公开的 Pass 通常包含繁多的命令行参数（Options）和统计量（Statistics）。MLIR 采用 **TableGen 声明式元编程 + CRTP** 的组合架构：
 
@@ -255,7 +255,7 @@ public:
 
 ---
 
-### 4.2 声明式 `.td` 选项解析与 CRTP 派生类实现
+### 4.2 声明式选项与派生实现
 
 在开发者编写的具体 Pass 实现中，代码极其精简，只需关注算法本身：
 

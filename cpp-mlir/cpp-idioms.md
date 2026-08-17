@@ -1,4 +1,4 @@
-# 编译器工程中的现代 C++ 惯用法
+# 编译器工程中的 C++ 惯用法
 
 > 本文系统梳理在阅读 LLVM、MLIR 以及 Triton 编译器源码（如 IR 节点定义、Pass 基础设施、ODS 生成代码）时常用的现代 C++ 语法与工程惯用法。内容包括**空基类优化（EBCO）**、**变长模板参数包**、**只读视图（`ArrayRef`/`function_ref`）**、**内存对齐与 SFINAE 编译期约束**。
 
@@ -8,19 +8,19 @@
 
 - [1. 内存布局与类定义控制](#1-内存布局与类定义控制)
   - [1.1 `using Base::Base` 构造继承](#11-using-basebase-构造继承)
-  - [1.2 `alignas(8)` 内存对齐与指针低位保留](#12-alignas8-内存对齐与指针低位保留)
-  - [1.3 特殊成员的显式禁用（`= delete`）](#13-特殊成员的显式禁用-delete)
+  - [1.2 `alignas(8)` 内存对齐与低位保留](#12-alignas8-内存对齐与低位保留)
+  - [1.3 特殊成员禁用（`= delete`）](#13-特殊成员禁用-delete)
 - [2. 模板元编程与 Trait 混入](#2-模板元编程与-trait-混入)
-  - [2.1 变长模板参数包（`Op<Derived, Traits...>`）](#21-变长模板参数包opderived-traits)
+  - [2.1 变长模板参数包](#21-变长模板参数包)
   - [2.2 空基类优化（EBCO）](#22-空基类优化ebco)
-  - [2.3 SFINAE 与 `std::enable_if_t` 条件匹配](#23-sfinae-与-stdenable_if_t-条件匹配)
+  - [2.3 SFINAE 与 `std::enable_if_t`](#23-sfinae-与-stdenable_if_t)
 - [3. 零拷贝视图与函数包装](#3-零拷贝视图与函数包装)
-  - [3.1 连续内存视图：`llvm::StringRef` 与 `llvm::ArrayRef`](#31-连续内存视图llvmstringref-与-llvmarrayref)
-  - [3.2 可调用对象引用：`llvm::function_ref` vs `std::function`](#32-可调用对象引用llvmfunction_ref-vs-stdfunction)
-  - [3.3 句柄转换与访问操作符（`operator bool` / `operator->`）](#33-句柄转换与访问操作符operator-bool--operator-)
+  - [3.1 连续内存视图（`StringRef` / `ArrayRef`）](#31-连续内存视图stringref--arrayref)
+  - [3.2 函数视图（`llvm::function_ref`）](#32-函数视图llvmfunction_ref)
+  - [3.3 句柄转换与访问操作符](#33-句柄转换与访问操作符)
 - [4. 迭代与结构化绑定](#4-迭代与结构化绑定)
-  - [4.1 结构化绑定（`auto [idx, val]`）](#41-结构化绑定auto-idx-val)
-  - [4.2 LLVM 迭代器工具：`llvm::enumerate` 与 `llvm::zip`](#42-llvm-迭代器工具llvmenumerate-与-llvmzip)
+  - [4.1 结构化绑定](#41-结构化绑定)
+  - [4.2 LLVM 迭代工具（`enumerate` / `zip`）](#42-llvm-迭代工具enumerate--zip)
 - [5. 核心语法速查表](#5-核心语法速查表)
 
 ---
@@ -62,7 +62,7 @@ public:
 
 ---
 
-### 1.2 `alignas(8)` 内存对齐与指针低位保留
+### 1.2 `alignas(8)` 内存对齐与低位保留
 
 在 64 位系统上，标准分配器通常保证内存地址满足机器字对齐。但在编译器底层（如 `TypeID::Storage`、LLVM `PointerIntPair`），为了在指针中利用空闲位（Bit Stealing）存储标记，必须显式通过 `alignas` 声明对齐契约：
 
@@ -85,7 +85,7 @@ LLVM 利用这一 C++ 语法保证，在 `llvm::PointerIntPair<T*, 2, bool>` 中
 
 ---
 
-### 1.3 特殊成员的显式禁用（`= delete`）
+### 1.3 特殊成员禁用（`= delete`）
 
 在 MLIR 的 `TypeID` 或编译期单例中，对象的内存物理地址充当了全局唯一的身份 ID。一旦发生内存移动（Move）或拷贝（Copy），身份的唯一性将被彻底破坏：
 
@@ -112,7 +112,7 @@ public:
 
 ## 2. 模板元编程与 Trait 混入
 
-### 2.1 变长模板参数包（`Op<Derived, Traits...>`）
+### 2.1 变长模板参数包
 
 MLIR 的具体算子类支持声明任意数量的 Traits（如 `MemRead`、`OneResult`、`IsCommutative`）。这是通过 C++11/C++17 的**变长模板模板参数包（Variadic Template Template Packs）**与**折叠表达式**实现的：
 
@@ -206,7 +206,7 @@ LoadOp 的内存排布 (EBCO 生效)
 
 ---
 
-### 2.3 SFINAE 与 `std::enable_if_t` 条件匹配
+### 2.3 SFINAE 与 `std::enable_if_t`
 
 在 LLVM 和 MLIR 模板库中，经常需要根据传入类型的特征选择不同的函数重载或类偏特化。**SFINAE（Substitution Failure Is Not An Error）** 与 `std::enable_if_t` 是核心工具：
 
@@ -231,7 +231,7 @@ struct PointerLikeTypeTraits<
 
 ## 3. 零拷贝视图与函数包装
 
-### 3.1 连续内存视图：`llvm::StringRef` 与 `llvm::ArrayRef`
+### 3.1 连续内存视图（`StringRef` / `ArrayRef`）
 
 在编译器中，字符串（如 Op 名称 `"tt.load"`）和数组（如操作数列表 `SmallVector<Value>`）频繁在 Pass 之间传递。如果使用 `const std::string &` 或 `const std::vector<T> &`，会面临类型绑定严格、不可跨容器连续切片等问题；若传值则引发堆内存分配。
 
@@ -272,7 +272,7 @@ public:
 
 ---
 
-### 3.2 可调用对象引用：`llvm::function_ref` vs `std::function`
+### 3.2 函数视图（`llvm::function_ref`）
 
 在 Pass 管理器和 Walk 遍历中，需要将回调函数（如 Lambda）传给底层算法。
 
@@ -319,7 +319,7 @@ function_ref<LogicalResult(OpPassManager &, Operation *)> executor = runPipeline
 
 ---
 
-### 3.3 句柄转换与访问操作符（`operator bool` / `operator->`）
+### 3.3 句柄转换与访问操作符
 
 MLIR 的 `OpView`、`Value`、`Type` 广泛采用了智能句柄设计，使值对象具备指针般的操作体验：
 
@@ -343,7 +343,7 @@ public:
 
 ## 4. 迭代与结构化绑定
 
-### 4.1 结构化绑定（`auto [idx, val]`）
+### 4.1 结构化绑定
 
 C++17 引入的结构化绑定允许直接解构 `std::tuple`、`std::pair` 或包含多个公有字段的结构体：
 
@@ -360,7 +360,7 @@ for (auto [nameAttr, valueAttr] : op->getAttrDictionary()) {
 
 ---
 
-### 4.2 LLVM 迭代器工具：`llvm::enumerate` 与 `llvm::zip`
+### 4.2 LLVM 迭代工具（`enumerate` / `zip`）
 
 在编写编译器 Pass 时，开发者经常需要同时获取元素索引与引用，或者并行遍历两个长度相等的容器。
 

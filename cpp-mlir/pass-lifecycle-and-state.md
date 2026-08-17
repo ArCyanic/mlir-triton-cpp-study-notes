@@ -6,25 +6,25 @@
 
 ## 目录
 
-- [1. 异构 Pass 队列的类型擦除与所有权](#1-异构-pass-队列的类型擦除与所有权)
-  - [1.1 `std::unique_ptr<Pass>` 容器与动态对象管理](#11-stdunique_ptrpass-容器与动态对象管理)
-  - [1.2 工厂构造与 `std::move` 所有权转移](#12-工厂构造与-stdmove-所有权转移)
-  - [1.3 虚析构函数级联释放时序](#13-虚析构函数级联释放时序)
-- [2. 多线程并行流水线与克隆机制](#2-多线程并行流水线与克隆机制)
-  - [2.1 多线程 Pass 的实例隔离](#21-多线程-pass-的实例隔离)
-  - [2.2 两阶段克隆机制（`clonePass()` + `copyOptionValuesFrom()`）](#22-两阶段克隆机制clonepass--copyoptionvaluesfrom)
-  - [2.3 `threadingSibling` 指针与诊断信息聚合](#23-threadingsibling-指针与诊断信息聚合)
-- [3. 单次执行上下文与 `PassExecutionState`](#3-单次执行上下文与-passexecutionstate)
-  - [3.1 长期配置与单次执行状态的分离](#31-长期配置与单次执行状态的分离)
-  - [3.2 `std::optional<PassExecutionState>` 的就地生命周期控制](#32-stdoptionalpassexecutionstate-的就地生命周期控制)
-  - [3.3 紧凑状态 `irAndPassFailed` 与 `function_ref` 生命周期](#33-紧凑状态-irandpassfailed-与-function_ref-生命周期)
-- [4. Pass 调度引擎生命周期时序与状态流转矩阵](#4-pass-调度引擎生命周期时序与状态流转矩阵)
+- [1. 异构 Pass 队列与所有权](#1-异构-pass-队列与所有权)
+  - [1.1 类型擦除与容器管理](#11-类型擦除与容器管理)
+  - [1.2 工厂构造与所有权转移](#12-工厂构造与所有权转移)
+  - [1.3 虚析构级联释放](#13-虚析构级联释放)
+- [2. 多线程并行流水线与克隆](#2-多线程并行流水线与克隆)
+  - [2.1 线程实例隔离](#21-线程实例隔离)
+  - [2.2 两阶段克隆机制](#22-两阶段克隆机制)
+  - [2.3 `threadingSibling` 溯源](#23-threadingsibling-溯源)
+- [3. 单次执行状态（`PassExecutionState`）](#3-单次执行状态passexecutionstate)
+  - [3.1 长期配置与执行状态分离](#31-长期配置与执行状态分离)
+  - [3.2 `optional` 就地构造](#32-optional-就地构造)
+  - [3.3 紧凑状态与回调生命周期](#33-紧凑状态与回调生命周期)
+- [4. 生命周期与状态流转矩阵](#4-生命周期与状态流转矩阵)
 
 ---
 
-## 1. 异构 Pass 队列的类型擦除与所有权
+## 1. 异构 Pass 队列与所有权
 
-### 1.1 `std::unique_ptr<Pass>` 容器与动态对象管理
+### 1.1 类型擦除与容器管理
 
 在 MLIR 中，一个编译流水线（Pipeline）由许多功能不同、拥有各自独立配置成员的具体 Pass 组成（如常量折叠 Pass、Warp 特化 Pass、死代码消除 Pass）。
 
@@ -58,7 +58,7 @@ std::vector<std::unique_ptr<Pass>> passes
 
 ---
 
-### 1.2 工厂构造与 `std::move` 所有权转移
+### 1.2 工厂构造与所有权转移
 
 在 Triton 源码中，Pass 通常通过公开的工厂函数创建并注册进 Pipeline：
 
@@ -84,7 +84,7 @@ OpPassManager.passes (成为该 Pass 堆内存的唯一所有者)
 
 ---
 
-### 1.3 虚析构函数级联释放时序
+### 1.3 虚析构级联释放
 
 当 `OpPassManager` 自身销毁或调用 `clear()` 时，容器内部的 `std::unique_ptr<Pass>` 会依次对其持有的裸指针调用 `delete`。
 
@@ -112,9 +112,9 @@ delete (Pass*)ptr
 
 ---
 
-## 2. 多线程并行流水线与克隆机制
+## 2. 多线程并行流水线与克隆
 
-### 2.1 多线程 Pass 的实例隔离
+### 2.1 线程实例隔离
 
 在现代编译器中，为了加速编译，PassManager 会将一个大型 Module 中的各个独立函数（`func.func`）分发到不同的 CPU 线程上并行执行（Multi-threaded Pipeline Execution）。
 
@@ -129,7 +129,7 @@ Thread 2 (处理 func_B) ──┘
 
 ---
 
-### 2.2 两阶段克隆机制（`clonePass()` + `copyOptionValuesFrom()`）
+### 2.2 两阶段克隆机制
 
 为了在复制 Pipeline 时既能保证派生类的完整多态性，又能保留用户动态修改过的命令行参数，MLIR 设计了 **两阶段克隆机制（Two-Stage Cloning）**：
 
@@ -171,7 +171,7 @@ protected:
 
 ---
 
-### 2.3 `threadingSibling` 指针与诊断信息聚合
+### 2.3 `threadingSibling` 溯源
 
 当复制出用于多线程并行的 Sibling Pass 副本后，框架需要保留它与原始主 Pass 的溯源关系，以便在编译结束时将多线程产生的耗时数据与优化统计量汇总到主 Pipeline：
 
@@ -185,7 +185,7 @@ for (const std::unique_ptr<Pass> &pass : mainPipeline.passes) {
 ```
 
 ```
-                 多线程 Sibling 诊断与统计聚合拓扑
+                  多线程 Sibling 诊断与统计聚合拓扑
  主线程 Main Pass (threadingSibling = nullptr) ◄────── 统计汇总归并
        ▲                                 ▲
        │ threadingSibling                │ threadingSibling
@@ -195,9 +195,9 @@ for (const std::unique_ptr<Pass> &pass : mainPipeline.passes) {
 
 ---
 
-## 3. 单次执行上下文与 `PassExecutionState`
+## 3. 单次执行状态（`PassExecutionState`）
 
-### 3.1 长期配置与单次执行状态的分离
+### 3.1 长期配置与执行状态分离
 
 在 Pass 的生命周期中，存在两种不同时间维度的数据：
 1. **长期静态配置（Long-Term Configuration）**：如 `numStages`、优化级别、调试开关。这些数据在 Pass 构造时确定，随 `clone()` 延续；
@@ -207,7 +207,7 @@ for (const std::unique_ptr<Pass> &pass : mainPipeline.passes) {
 
 ---
 
-### 3.2 `std::optional<PassExecutionState>` 的就地生命周期控制
+### 3.2 `optional` 就地构造
 
 MLIR 通过在基类 `Pass` 中维护一个 `std::optional<PassExecutionState>`，在每一次 Pass 执行前后实现上下文的**就地挂载与清空**：
 
@@ -243,7 +243,7 @@ PassManager 调度器准备执行当前 Pass
 
 ---
 
-### 3.3 紧凑状态 `irAndPassFailed` 与 `function_ref` 生命周期
+### 3.3 紧凑状态与回调生命周期
 
 `PassExecutionState` 结构体的内部实现：
 
@@ -277,7 +277,7 @@ if (failed(runPipeline(pm, getOperation())))
 
 ---
 
-## 4. Pass 调度引擎生命周期时序与状态流转矩阵
+## 4. 生命周期与状态流转矩阵
 
 ```
                 MLIR Pass 生命周期流转矩阵
@@ -309,4 +309,4 @@ if (failed(runPipeline(pm, getOperation())))
 > **总结**：
 > - **类型擦除与虚析构**：确保了异构 Pass 可以在同一个队列中统一管理与多态销毁；
 > - **两阶段克隆与 Sibling 溯源**：在保证多线程执行环境隔离的同时，维持了全局配置一致性与监控诊断聚合；
-> - **`PassExecutionState` 就地分离**：清晰划分了长期配置与单次上下文，避免了多线程状态污染与生命周期问题。
+> - **`PassExecutionState` 就地分离**：清晰划分了长期配置与单次上下文，避免了多线程状态污染与生命周期问题。\n

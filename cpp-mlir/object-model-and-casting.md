@@ -1,4 +1,4 @@
-# C++ 对象模型、LLVM Cast 体系与 MLIR 句柄架构
+# C++ 对象模型、LLVM Cast 与 MLIR 句柄
 
 > 本文以编译器中间表示（IR）中的典型节点——兼具通用调度与内存效果查询的 `LoadOp` 为用例，从 64 位内存字节排布、Itanium C++ ABI 虚表拓扑出发，剖析标准 C++ 多态机制的底层开销；进而推导 LLVM 为何基于 `SubclassID` 构建静态标签分发体系（`isa/cast/dyn_cast`），以及 MLIR 为何进一步演进为解耦实体与视图的 Extensible Typed Wrapper（`OpView` + `TypeID`）架构。
 
@@ -6,32 +6,32 @@
 
 ## 目录
 
-- [1. 标准 C++ 对象的内存排布与 Itanium ABI 虚表分派](#1-标准-c-对象的内存排布与-itanium-abi-虚表分派)
-  - [1.1 贯穿场景建模：多接口 IR 加载节点 `LoadOp`](#11-贯穿场景建模多接口-ir-加载节点-loadop)
-  - [1.2 64 位内存排布（0x00 到 0x27 拓扑）](#12-64-位内存排布0x00-到-0x27-拓扑)
-  - [1.3 虚表内部结构：`offset-to-top`、RTTI 描述符与槽位](#13-虚表内部结构offset-to-toprtti-描述符与槽位)
-  - [1.4 指针转换与 Thunk 机制：静态偏移修正 vs `dynamic_cast` 寻路](#14-指针转换与-thunk-机制静态偏移修正-vs-dynamic_cast-寻路)
-- [2. 为什么 LLVM 与 MLIR 不采用 C++ 原生多态？](#2-为什么-llvm-与-mlir-不采用-c-原生多态)
-  - [2.1 虚表与 RTTI 的内存与缓存开销](#21-虚表与-rtti-的内存与缓存开销)
-  - [2.2 间接调用的性能影响与内联阻碍](#22-间接调用的性能影响与内联阻碍)
-  - [2.3 动态库符号可见性与 `-fno-rtti`](#23-动态库符号可见性与--fno-rtti)
-- [3. LLVM 标签多态体系：`SubclassID` 与 `classof`](#3-llvm-标签多态体系subclassid-与-classof)
-  - [3.1 零虚表设计：`llvm::Value` 的 1 字节标签](#31-零虚表设计llvmvalue-的-1-字节标签)
-  - [3.2 `classof` 契约与连续枚举区间优化](#32-classof-契约与连续枚举区间优化)
-  - [3.3 LLVM Cast 体系分发流水线（`isa/cast/dyn_cast`）](#33-llvm-cast-体系分发流水线isacastdyn_cast)
-- [4. MLIR 的 Extensible Handle-Body 架构与 `TypeID`](#4-mlir-的-extensible-handle-body-架构与-typeid)
-  - [4.1 为什么封闭式枚举继承树在 MLIR 中不再适用？](#41-为什么封闭式枚举继承树在-mlir-中不再适用)
-  - [4.2 实体与视图解耦：`Operation` 实体与 8 字节句柄（`OpView`）](#42-实体与视图解耦operation-实体与-8-字节句柄opview)
-  - [4.3 `TypeID` 机制与 `AbstractOperation` 概念分发](#43-typeid-机制与-abstractoperation-概念分发)
-- [5. 多态体系对比与类型转换决策树](#5-多态体系对比与类型转换决策树)
-  - [5.1 三种多态体系特性对比表](#51-三种多态体系特性对比表)
-  - [5.2 编译器源码阅读与类型转换决策树](#52-编译器源码阅读与类型转换决策树)
+- [1. C++ 内存排布与虚表分派](#1-c-内存排布与虚表分派)
+  - [1.1 场景建模（LoadOp）](#11-场景建模loadop)
+  - [1.2 内存排布与拓扑结构](#12-内存排布与拓扑结构)
+  - [1.3 虚表结构与元数据](#13-虚表结构与元数据)
+  - [1.4 指针转换与 Thunk 机制](#14-指针转换与-thunk-机制)
+- [2. 编译器放弃原生多态的动因](#2-编译器放弃原生多态的动因)
+  - [2.1 内存与缓存开销](#21-内存与缓存开销)
+  - [2.2 间接调用与内联阻碍](#22-间接调用与内联阻碍)
+  - [2.3 动态库符号与 -fno-rtti](#23-动态库符号与--fno-rtti)
+- [3. LLVM 标签多态（SubclassID / classof）](#3-llvm-标签多态subclassid--classof)
+  - [3.1 零虚表单字节标签](#31-零虚表单字节标签)
+  - [3.2 classof 契约与区间编码](#32-classof-契约与区间编码)
+  - [3.3 LLVM Cast 分发流水线](#33-llvm-cast-分发流水线)
+- [4. MLIR 句柄架构与 TypeID](#4-mlir-句柄架构与-typeid)
+  - [4.1 封闭枚举的扩展局限](#41-封闭枚举的扩展局限)
+  - [4.2 实体与视图解耦（OpView）](#42-实体与视图解耦opview)
+  - [4.3 TypeID 与 AbstractOperation 分发](#43-typeid-与-abstractoperation-分发)
+- [5. 多态选型与转换决策](#5-多态选型与转换决策)
+  - [5.1 多态体系特性对比](#51-多态体系特性对比)
+  - [5.2 类型转换决策流](#52-类型转换决策流)
 
 ---
 
-## 1. 标准 C++ 对象的内存排布与 Itanium ABI 虚表分派
+## 1. C++ 内存排布与虚表分派
 
-### 1.1 贯穿场景建模：多接口 IR 加载节点 `LoadOp`
+### 1.1 场景建模（LoadOp）
 
 在编译器设计中，IR 节点通常需要同时满足多个维度的接口契约：
 1. **基础遍历与调度契约**（`Operation`）：提供操作码（Opcode）和统一执行接口 `execute()`；
@@ -72,7 +72,7 @@ struct LoadOp : public Operation, public MemoryEffect {
 
 ---
 
-### 1.2 64 位物理内存排布（Byte 0 到 39 拓扑图）
+### 1.2 内存排布与拓扑结构
 
 当我们在栈上或堆上分配一个 `LoadOp load(ptr)` 对象时，主流 64 位平台（遵循 Itanium C++ ABI，包括 GCC 与 Clang）会在内存中生成一个连续的 **40 字节结构体**。
 
@@ -104,7 +104,7 @@ struct LoadOp : public Operation, public MemoryEffect {
 
 ---
 
-### 1.3 虚表内部结构：`offset-to-top`、RTTI 描述符与槽位
+### 1.3 虚表结构与元数据
 
 为了支撑多态调用与指针转换，编译器在只读数据段（`.rodata`）中为 `LoadOp` 生成了两个逻辑关联的虚表（VTable）：
 
@@ -140,7 +140,7 @@ struct LoadOp : public Operation, public MemoryEffect {
 
 ---
 
-### 1.4 指针转换与 Thunk 机制：静态偏移修正 vs `dynamic_cast` 寻路
+### 1.4 指针转换与 Thunk 机制
 
 当我们在 C++ 中使用不同的指针类型操作同一个 `LoadOp` 实例时，底层的指针数值与调用路径会发生根本性的物理分化：
 
@@ -223,9 +223,9 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-## 2. 为什么 LLVM 与 MLIR 不采用 C++ 原生多态？
+## 2. 编译器放弃原生多态的动因
 
-### 2.1 虚表与 RTTI 的内存与缓存开销
+### 2.1 内存与缓存开销
 
 在编译器（如编译 PyTorch、Linux 内核或大型深度学习模型）中，IR 图包含的节点数量通常在 $10^5 \sim 10^7$ 量级。
 
@@ -240,7 +240,7 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-### 2.2 间接调用的性能影响与内联阻碍
+### 2.2 间接调用与内联阻碍
 
 1. **分支预测惩罚（Indirect Branch Penalty）**：
    - 虚函数分派通过寄存器间接跳转（`call *%rax`）。
@@ -251,7 +251,7 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-### 2.3 动态库符号可见性与 `-fno-rtti`
+### 2.3 动态库符号与 -fno-rtti
 
 现代编译器基础设施（如 LLVM、Clang、MLIR、Triton）普遍由动态共享库（DSO）以及动态加载的后端插件组成。
 
@@ -263,9 +263,9 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 
 ---
 
-## 3. LLVM 标签多态体系：`SubclassID` 与 `classof`
+## 3. LLVM 标签多态（SubclassID / classof）
 
-### 3.1 零虚表设计：`llvm::Value` 的 1 字节标签
+### 3.1 零虚表单字节标签
 
 LLVM 的核心设计是：**保留 C++ 类继承体系，但移除 `virtual` 关键字与虚函数表**。
 
@@ -313,7 +313,7 @@ public:
 
 ---
 
-### 3.2 `classof` 契约与连续区间编码优化
+### 3.2 classof 契约与区间编码
 
 既然没有虚表和 RTTI，LLVM 如何在运行时判定一个 `Value*` 到底是不是 `LoadInst*`？
 
@@ -385,7 +385,7 @@ setbe   %al                   ; 0 周期内完成判定
 
 ---
 
-### 3.3 LLVM Cast 体系分发流水线（`isa/cast/dyn_cast`）
+### 3.3 LLVM Cast 分发流水线
 
 基于 `classof` 静态契约，LLVM 构建了现代化的模板分发流水线。在底层，所有公共接口统一委托给模板适配器 `llvm::CastInfo<To, From>`：
 
@@ -449,9 +449,9 @@ void processInstruction(llvm::Instruction *inst) {
 
 ---
 
-## 4. MLIR 的 Extensible Handle-Body 架构与 `TypeID`
+## 4. MLIR 句柄架构与 TypeID
 
-### 4.1 为什么封闭式枚举继承树在 MLIR 中不再适用？
+### 4.1 封闭枚举的扩展局限
 
 LLVM 的 `SubclassID` 方案完美解决了封闭世界（Closed World）下的性能与内存问题。但当编译技术演进到多方言嵌套、动态插件化的 **MLIR 时代** 时，这一方案遇到了根本性的架构瓶颈：
 
@@ -473,7 +473,7 @@ LLVM 模式 (封闭继承树)                   MLIR 模式 (无限方言插件�
 
 ---
 
-### 4.2 实体与视图解耦：`Operation` 实体与 8 字节句柄（`OpView`）
+### 4.2 实体与视图解耦（OpView）
 
 在 MLIR 中，内存中的真实对象与开发者在 C++ 中操作的类型接口被彻底划分为两个正交的维度：
 
@@ -534,7 +534,7 @@ public:
 
 ---
 
-### 4.3 `TypeID` 机制与 `AbstractOperation` 概念分发
+### 4.3 TypeID 与 AbstractOperation 分发
 
 既然没有任何 C++ 物理继承和硬编码枚举，MLIR 是如何在运行时实现 $O(1)$ 的类型转换（`dyn_cast<LoadOp>(Operation*)`）以及接口查询（`dyn_cast<MemoryEffectOpInterface>(op)`）的？
 
@@ -607,9 +607,9 @@ void analyzeOperation(mlir::Operation *op) {
 
 ---
 
-## 5. 多态体系对比与类型转换决策树
+## 5. 多态选型与转换决策
 
-### 5.1 三种多态体系特性对比表
+### 5.1 多态体系特性对比
 
 | 机制维度 | 1. 标准 C++ 多继承（Itanium ABI） | 2. LLVM 静态标签继承树 | 3. MLIR Extensible Handle-Body |
 | :--- | :--- | :--- | :--- |
@@ -623,7 +623,7 @@ void analyzeOperation(mlir::Operation *op) {
 
 ---
 
-### 5.2 编译器源码阅读与类型转换决策树
+### 5.2 类型转换决策流
 
 ```
                     编译器源码阅读与类型转换因果路径

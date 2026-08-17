@@ -21,8 +21,8 @@ struct VerifyWarpSpecializationPartitions
 
 | 序号 | 模块 | 核心问题 | 关键机制与落点 |
 | :---: | :--- | :--- | :--- |
-| **00** | [编译器工程中的现代 C++ 惯用法](cpp-idioms.md) | 怎样解析 LLVM/MLIR 源码中反复出现的构造继承、EBCO、变长模板包与零拷贝视图？ | `using Base::Base`、`alignas(8)`、`= delete`、EBCO 空基类优化、`ArrayRef`、`function_ref`、`llvm::enumerate` |
-| **01** | [C++ 对象模型、LLVM Cast 体系与 MLIR 句柄架构](object-model-and-casting.md) | 为什么编译器放弃 C++ 虚表多态？LLVM 与 MLIR 如何在零开销与动态扩展下完成类型分派？ | 内存排布、Itanium ABI 虚表、Thunk、`SubclassID`、`classof`、`CastInfo`、`TypeID`、`OpView` |
+| **00** | [编译器工程中的 C++ 惯用法](cpp-idioms.md) | 怎样解析 LLVM/MLIR 源码中反复出现的构造继承、EBCO、变长模板包与零拷贝视图？ | `using Base::Base`、`alignas(8)`、`= delete`、EBCO 空基类优化、`ArrayRef`、`function_ref`、`llvm::enumerate` |
+| **01** | [C++ 对象模型、LLVM Cast 与 MLIR 句柄](object-model-and-casting.md) | 为什么编译器放弃 C++ 虚表多态？LLVM 与 MLIR 如何在零开销与动态扩展下完成类型分派？ | 内存排布、Itanium ABI 虚表、Thunk、`SubclassID`、`classof`、`CastInfo`、`TypeID`、`OpView` |
 | **02** | [MLIR TypeID 机制与 LLVM 紧凑指针](typeid-and-tagged-pointers.md) | MLIR 怎样产生稳定类型身份，怎样比较它，为什么锚点要 8 字节对齐并能支持低位复用？ | `TypeID::get<T>()`、Resolver 作用域、显式 TypeID 宏、`PointerLikeTypeTraits`、`PointerIntPair` |
 | **03** | [CRTP 模式与 PassWrapper 基础设施](crtp-and-pass-wrapper.md) | 普通基类不知道最终派生类型时，怎样把该类型注入通用样板代码？ | `PassWrapper<PassT, BaseT>` 中依赖 `PassT` 的表达式、向下 `static_cast`、延迟实例化 |
 | **04** | [MLIR Pass 生命周期与执行状态管理](pass-lifecycle-and-state.md) | PassManager 怎样拥有和复制异构 Pass？长期配置与单次执行状态怎样分离？ | `unique_ptr<Pass>`、`Pass::clone()`、`PassExecutionState`、`threadingSibling` |
@@ -51,7 +51,8 @@ struct VerifyWarpSpecializationPartitions
 2. **[01. C++ 对象模型与 LLVM/MLIR 类型体系](object-model-and-casting.md)**：建立内存排布、ABI 虚表、LLVM 标签多态与 MLIR Handle-Body 架构心智；
 3. **[02. TypeID 机制与紧凑指针](typeid-and-tagged-pointers.md)**：掌握类型身份的跨模块作用域与 `PointerIntPair` 指针位复用技术；
 4. **[03. CRTP 模式与 PassWrapper](crtp-and-pass-wrapper.md)**：理解如何利用编译期派生注入消除 Pass 通用样板代码；
-5. **[04. Pass 生命周期与状态管理](pass-lifecycle-and-state.md)**：系统掌握异构 Pass 队列、多线程并行克隆与单次执行状态安装。
+5. **[04. Pass 生命周期与状态管理](pass-lifecycle-and-state.md)**：系统掌握异构 Pass 队列、多线程并行克隆与单次执行状态安装；
+6. **[05. 值类别与函数传参类型系统](../cpp-basic/value-categories-and-parameter-passing.md)**：彻底理清五大值类别、移动语义物理机制、Sink Parameter 模式与完美转发。
 
 ---
 

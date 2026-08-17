@@ -6,26 +6,26 @@
 
 ## 目录
 
-- [1. `TypeID` 身份模型与作用域策略](#1-typeid-身份模型与作用域策略)
-  - [1.1 实现原理：静态变量地址作为类型身份](#11-实现原理静态变量地址作为类型身份)
-  - [1.2 跨编译单元与动态库的作用域策略](#12-跨编译单元与动态库的作用域策略)
-  - [1.3 统一 Pass 句柄中的身份保存与 `classof` 消费](#13-统一-pass-句柄中的身份保存与-classof-消费)
-- [2. 指针位复用与 `PointerLikeTypeTraits`](#2-指针位复用与-pointerliketypetraits)
-  - [2.1 内存对齐与指针低位空闲空间](#21-内存对齐与指针低位空闲空间)
-  - [2.2 `PointerLikeTypeTraits` 适配协议](#22-pointerliketypetraits-适配协议)
-- [3. LLVM 紧凑数据结构应用](#3-llvm-紧凑数据结构应用)
-  - [3.1 `llvm::PointerIntPair`：指针与标志位的单字压缩](#31-llvmpointerintpair指针与标志位的单字压缩)
-  - [3.2 `llvm::PointerUnion`：8 字节互斥类型判别联合体](#32-llvmpointerunion8-字节互斥类型判别联合体)
+- [1. TypeID 身份模型与作用域](#1-typeid-身份模型与作用域)
+  - [1.1 静态变量地址模型](#11-静态变量地址模型)
+  - [1.2 跨编译单元作用域策略](#12-跨编译单元作用域策略)
+  - [1.3 Pass 句柄身份保存与 classof](#13-pass-句柄身份保存与-classof)
+- [2. 指针位复用与 TypeTraits](#2-指针位复用与-typetraits)
+  - [2.1 内存对齐与低位空闲空间](#21-内存对齐与低位空闲空间)
+  - [2.2 PointerLikeTypeTraits 适配](#22-pointerliketypetraits-适配)
+- [3. LLVM 紧凑数据结构](#3-llvm-紧凑数据结构)
+  - [3.1 PointerIntPair 紧凑存储](#31-pointerintpair-紧凑存储)
+  - [3.2 PointerUnion 判别联合体](#32-pointerunion-判别联合体)
   - [3.3 掩码位运算与指令效率](#33-掩码位运算与指令效率)
-- [4. 跨模块链接问题与内存调试决策树](#4-跨模块链接问题与内存调试决策树)
-  - [4.1 跨 DSO 静态锚点多副本排查](#41-跨-dso-静态锚点多副本排查)
-  - [4.2 紧凑指针越界调试](#42-紧凑指针越界调试)
+- [4. 跨模块链接与调试](#4-跨模块链接与调试)
+  - [4.1 跨 DSO 静态锚点排查](#41-跨-dso-静态锚点排查)
+  - [4.2 紧凑指针调试流](#42-紧凑指针调试流)
 
 ---
 
-## 1. `TypeID` 身份模型与作用域策略
+## 1. TypeID 身份模型与作用域
 
-### 1.1 实现原理：静态变量地址作为类型身份
+### 1.1 静态变量地址模型
 
 在编译器基础设施（如 MLIR Pass 框架）中，当具体类型被擦除为统一的 `Pass *` 或 `void *` 时，系统必须在没有标准 C++ RTTI（`-fno-rtti`）的前提下，保留判定“当前指针到底属于哪一个具体派生类”的能力。
 
@@ -61,7 +61,7 @@ TypeID::get<PassB>() ──► 内存地址: 0x55aa0108 (PassB 的静态锚点) 
 
 ---
 
-### 1.2 跨编译单元与动态库的作用域策略
+### 1.2 跨编译单元作用域策略
 
 在复杂的编译器项目中，代码会被分割为静态库（`.a`）、动态共享库（`.so`/`.dylib`）或独立插件。如何确保“全局唯一定位到一个 C++ 类型”的静态锚点地址在不同的链接环境下不发生错位？
 
@@ -111,7 +111,7 @@ mlir::TypeID dynamicOpID = dynamicAllocator.allocate();
 
 ---
 
-### 1.3 统一 Pass 句柄中的身份保存与 `classof` 消费
+### 1.3 Pass 句柄身份保存与 classof
 
 在 Triton 与 MLIR 的 Pass 调度中，所有具体 Pass 都被收束为基类指针 `Pass *`。基类 `Pass` 在构造时捕获该身份，派生类通过 `classof` 谓词完成类型消费：
 
@@ -147,9 +147,9 @@ void inspect(const Pass *pass) {
 
 ---
 
-## 2. 指针位复用与 `PointerLikeTypeTraits`
+## 2. 指针位复用与 TypeTraits
 
-### 2.1 内存对齐与指针低位空闲空间
+### 2.1 内存对齐与低位空闲空间
 
 现代 64 位 CPU 架构中，数据通常需要按照自身大小进行自然对齐（Natural Alignment）。当一个对象的物理地址按照 **8 字节（$2^3$）边界对齐** 时，其 64 位二进制地址的**最低 3 位必然恒为 `000`**：
 
@@ -171,7 +171,7 @@ void inspect(const Pass *pass) {
 
 ---
 
-### 2.2 `PointerLikeTypeTraits` 适配协议
+### 2.2 PointerLikeTypeTraits 适配
 
 为了让任意自定义类型（如 `mlir::TypeID`）能够无缝接入 LLVM 的紧凑指针容器，MLIR 提供了 `PointerLikeTypeTraits` 偏特化契约：
 
@@ -197,9 +197,9 @@ struct PointerLikeTypeTraits<mlir::TypeID> {
 
 ---
 
-## 3. LLVM 紧凑数据结构应用
+## 3. LLVM 紧凑数据结构
 
-### 3.1 `llvm::PointerIntPair`：指针与标志位的单字压缩
+### 3.1 PointerIntPair 紧凑存储
 
 在编译器开发中，经常需要将一个指针与一个布尔状态捆绑（如“IR 操作指针 + 是否失败标记”）。如果写成普通结构体：
 
@@ -242,7 +242,7 @@ bool failed = irAndPassFailed.getInt();
 
 ---
 
-### 3.2 `llvm::PointerUnion`：8 字节互斥类型判别联合体
+### 3.2 PointerUnion 判别联合体
 
 在 IR 体系中，一个操作数（`Operand`）可能是一个 SSA `Value*`，也可能是一个静态 `Block*`。标准 C++ 的 `std::variant<Value*, Block*>` 占用 16 字节。
 
@@ -296,9 +296,9 @@ andq    $7, %rax              ; 7 即 0b111
 
 ---
 
-## 4. 跨模块链接问题与内存调试决策树
+## 4. 跨模块链接与调试
 
-### 4.1 跨 DSO 静态锚点多副本排查
+### 4.1 跨 DSO 静态锚点排查
 
 当自定义 Pass 或 Dialect 跨越多个动态库（`.so`）编译时，若不慎使用了错误的 Resolver 声明，可能导致不同动态库各自生成独立的静态局部变量，引发 `TypeID` 比对失败：
 
@@ -317,7 +317,7 @@ libB.so: TypeID::get<MyType>() ──► 0x7fff_bbb0 (libB 中的静态锚点) �
 
 ---
 
-### 4.2 紧凑指针越界调试
+### 4.2 紧凑指针调试流
 
 ```
                          紧凑指针调试决策树
