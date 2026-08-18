@@ -1,21 +1,22 @@
 # MLIR 与编译器基础设施学习笔记
 
-> 本项目收录关于现代 C++ 系统机制、MLIR 核心架构以及专用硬件加速方言（TensorView）的技术笔记与工程剖析。
-
----
+> 本项目收录关于现代 C++ 系统机制、MLIR 核心架构、编译器经典算法以及专用硬件加速方言（TensorView）的技术笔记与工程剖析。
 
 ## 知识体系分层与阅读路径
 
 文档按层次组织，排在前面的内容作为后续文档的前置基础：
 
-```
-                    MLIR 与 C++ 知识体系分层
+```text
+                    MLIR 与编译器系统知识体系分层
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. 专用方言与硬件加速 (Dialects & Acceleration)                              │
+│ 4. 专用方言与硬件加速 (Dialects & Acceleration)                              │
 │    └── tensor-view-core-guide.md: TensorView 设计动机、ODS 建模、提升与降级 │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ 2. 框架核心理论与实现 (MLIR Core Framework)                                  │
+│ 3. 框架核心理论与实现 (MLIR Core Framework)                                  │
 │    └── mlir-toy-study-notes.md: Toy 语言全景、AST 到 IR、Dialect 转换与优化 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 2. 编译器核心算法与真实场景 (Compiler Algorithms)                           │
+│    └── algorithm/README.md ──► 显存 DAG 调度、Linalg Tile & Fuse 切片推导等  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. 编译器 C++ 核心基础设施 (C++ in Compiler)                                 │
 │    ├── cpp-basic/README.md ──► 基础类型系统、值类别传参、STL 容器失效等       │
@@ -23,11 +24,9 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
 ## 模块导航
 
-### 1. 现代 C++ 语言基础与通用机制 (`cpp-basic/`)
+### 1. 现代 C++ 核心机制 (cpp-basic/)
 
 *概览与导航*：**[现代 C++ 基础核心机制](cpp-basic/README.md)**
 
@@ -41,9 +40,7 @@
 | **05** | [模板元编程、SFINAE 与 Concepts](cpp-basic/templates-sfinae-and-concepts.md) | 两阶段名字查找、`std::enable_if_t`、`std::void_t` 探测、`if constexpr`、Concepts 偏序决议 |
 | **06** | [编译流水线、链接模型与 ELF](cpp-basic/compiler-toolchain-and-elf-linking.md) | 编译四阶段、链接属性（External/Internal）、ELF Section/Segment、`extern "C"`、`.init_array`、静态库链接顺序 |
 
----
-
-### 2. MLIR / LLVM 定制 C++ 架构与基础设施 (`cpp-mlir/`)
+### 2. MLIR 定制 C++ 架构基础设施 (cpp-mlir/)
 
 *概览与模块关系*：**[阅读 MLIR Pass 所需的 C++ 机制](cpp-mlir/README.md)**
 
@@ -55,30 +52,31 @@
 | **03** | [CRTP 模式与 PassWrapper 基础设施](cpp-mlir/crtp-and-pass-wrapper.md) | 不完整类型延迟实例化、`PassWrapper` 类型注入、`clonePass()` 静态转换、TableGen 生成基类 |
 | **04** | [MLIR Pass 生命周期与执行状态管理](cpp-mlir/pass-lifecycle-and-state.md) | `std::unique_ptr<Pass>` 异构管理、多线程两阶段克隆、`PassExecutionState` 就地构造与作用域 |
 
----
+### 3. 编译器核心算法体系 (algorithm/)
 
-### 2. MLIR 核心框架与实现
+*概览与体系分类*：**[编译器算法与真实场景架构](algorithm/README.md)**
+
+| 序号 | 文档 / 代码 | 核心主题 |
+| :---: | :--- | :--- |
+| **01** | [计算图 DAG 峰值显存最小化拓扑调度算法](algorithm/peak-memory-dag-scheduling.md) | 显存峰值爆炸机理、Liveness 活跃期分析、MLIR Use-Def 建模、XOR-Sum O(1) 查找同伴算子与优先级跃升 ([01-peak-memory-dag-scheduler.cpp](algorithm/01-peak-memory-dag-scheduler.cpp)) |
+| **02** | [Linalg 平铺融合切片逆向传播算法](algorithm/linalg-tile-and-fuse-slice-propagation.md) | 多面体循环分块、`linalg.generic` 平铺融合、仿射逆映射包围盒推导、SRAM 显存带宽收益与 Halo 边界冗余权衡 ([02-linalg-tile-and-fuse-slice-propagation.cpp](algorithm/02-linalg-tile-and-fuse-slice-propagation.cpp)) |
+
+### 4. MLIR 核心框架实现
 
 | 文档名称 | 核心主题 |
 | :--- | :--- |
-| **[MLIR 核心架构与 Toy 教程学习笔记](mlir-toy-study-notes.md)** | AST 到 MLIR 生成、ODS/TableGen 算子定义、TypeStorage 唯一化、Shape 推导接口、Dialect 转换流水线与 JIT 运行时执行。 |
+| **[MLIR 核心架构与底层机制解析](mlir-toy-study-notes.md)** | AST 到 MLIR 生成、ODS/TableGen 算子定义、TypeStorage 唯一化、Shape 推导接口、Dialect 转换流水线与 JIT 运行时执行。 |
 
----
-
-### 3. 专用方言与硬件加速实战
+### 5. 专用方言与硬件加速
 
 | 文档名称 | 核心主题 |
 | :--- | :--- |
-| **[Triton TensorView：硬件动机、结构化 IR 与编译提升机制](tensor-view-core-guide.md)** | SIMT 掩码寻址 vs 2D DMA 硬件动机、`make_tensor_view` 寻址几何与 `load_view` 读写解耦、ODS Builder 构造链、`TritonRaiseTensorView` 模式提升 Pass、DMA 描述符生成。 |
-
----
+| **[Triton TensorView 结构化张量视图机制](tensor-view-core-guide.md)** | SIMT 掩码寻址 vs 2D DMA 硬件动机、`make_tensor_view` 寻址几何与 `load_view` 读写解耦、ODS Builder 构造链、`TritonRaiseTensorView` 模式提升 Pass、DMA 描述符生成。 |
 
 ## 阅读约定
 
 1. **自包含性（Self-Containment）**：主文档内部专注于本篇主题，不设置跨文档相互跳转；
 2. **知识继承**：前序文档为后续文档的基础支撑（阅读 MLIR 核心理论前建议了解 C++ 基础机制；阅读 TensorView 前建议了解 MLIR 转换理论）。
-
----
 
 ## 开源协议 (License)
 

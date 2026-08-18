@@ -2,8 +2,6 @@
 
 > 本文档作为 `cpp-basic` 知识底座的**高信息密度极速查阅索引**。剔除所有冗余叙述，直击各语言特性的**核心机制、物理内存模型、关键代码/图解、关键设计边界与典型避坑准则**，并附带深度解析文档的精准章节跳转。
 
----
-
 ## 目录
 
 - [1. 值类别、传参机制与生命周期](#1-值类别传参机制与生命周期)
@@ -45,8 +43,6 @@
   - [6.4 C++ Name Mangling 编码规则与 `extern "C"` 桥接](#64-c-name-mangling-编码规则与-extern-c-桥接)
   - [6.5 全局对象 `.init_array` 构造链与 Meyers' Singleton](#65-全局对象-init_array-构造链与-meyers-singleton)
   - [6.6 静态库单遍扫描算法与命令行链接顺序敏感性](#66-静态库单遍扫描算法与命令行链接顺序敏感性)
-
----
 
 ## 1. 值类别、传参机制与生命周期
 
@@ -97,8 +93,6 @@
   4. **反模式**：`const T&&` 既要右值又不准修改，导致退化深拷贝，现实中仅用于 `= delete` 禁用右值入参。
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3 章](value-categories-and-parameter-passing.md#3-形参空间与绑定矩阵)
 
----
-
 ### 1.3 Sink Parameter 传值 + `std::move` 模式
 
 * **模式代码**：
@@ -116,8 +110,6 @@
   * **实参传左值**（`Node(name_var, op_var)`）：形参触发 1 次深拷贝构造，初始化列表触发 1 次移动构造 $\implies$ **共 1 Copy + 1 Move**（保全调用方原数据）；
   * **实参传右值/临时对象**（`Node("Add", {1, 2})`）：形参触发 1 次移动构造，初始化列表触发 1 次移动构造 $\implies$ **共 0 Copy + 2 Move**（全生命周期 0 堆内存分配）。
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 3.5 节](value-categories-and-parameter-passing.md#35-传参范式与-sink-模式)
-
----
 
 ### 1.4 `std::move` 本质与 `const` 移动退化
 
@@ -137,8 +129,6 @@
   * **机理**：`std::move(const)` 产生 `const std::vector<int>&&`，因带 `const` 无法绑定非常量 `vector(vector&&)`，编译器自动退回调用拷贝构造 `vector(const vector&)`。
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 4 章](value-categories-and-parameter-passing.md#4-移动语义与类型退化)
 
----
-
 ### 1.5 返回值优化（RVO/NRVO）与 `return std::move` 反优化
 
 * **C++17 保证拷贝消除（RVO）**：返回同类型纯右值（`return std::vector<int>{1, 2};`）由标准强制保证直接在调用方存储位置就地构造，**0 拷贝、0 移动**。
@@ -152,8 +142,6 @@
   ```
   * **机理**：显式写 `std::move` 将具名左值强转为右值引用表达式，编译器被迫放弃 0 开销的 NRVO 栈地址合并，退化去执行 1 次移动构造函数。
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 5 章](value-categories-and-parameter-passing.md#5-拷贝消除与返回值优化)
-
----
 
 ### 1.6 万能引用、引用折叠规则与 `std::forward`
 
@@ -171,8 +159,6 @@
   }
   ```
 * **🔗 深度解析**：[value-categories-and-parameter-passing.md 第 6 章](value-categories-and-parameter-passing.md#6-万能引用与完美转发)
-
----
 
 ## 2. STL 容器内部原理、迭代器与异常安全
 
@@ -201,8 +187,6 @@
   * `Contiguous` 严格保证物理地址连续性：`&(*(it + n)) == (&*it) + n`（如 `std::vector`、原生指针 `T*`）。
 * **🔗 深度解析**：[iterators-and-stl-containers.md 第 1 章](iterators-and-stl-containers.md#1-stl-四层抽象架构与设计哲学)
 
----
-
 ### 2.2 `std::vector` 三指针内存模型与扩容失效规则
 
 ```text
@@ -221,8 +205,6 @@ std::vector<T> 控制句柄 (栈上 24 字节)
   * **非扩容中间插入**：插入点之前的迭代器有效，**插入点及其之后的所有迭代器/引用因元素后移全部失效**；
   * **删除操作（`erase`）**：被删元素及后续元素的迭代器/引用失效。
 * **🔗 深度解析**：[iterators-and-stl-containers.md 第 3.1 与 4.1 节](iterators-and-stl-containers.md#31-stdvector连续堆内存与三指针模型)
-
----
 
 ### 2.3 `std::deque` 中控映射表与分段缓冲区模型
 
@@ -244,8 +226,6 @@ Buffer 2:        [ Elem 4 | Elem 5 |   |   ]
   * 头尾插入可能引发中控表重分配导致迭代器失效，但**指向已有元素的指针和引用保持物理有效**。
 * **🔗 深度解析**：[iterators-and-stl-containers.md 第 3.2 节](iterators-and-stl-containers.md#32-stddeque中控索引数组与分段连续缓冲区map-of-chunks)
 
----
-
 ### 2.4 哈希表 `unordered_map` Rehash 后的指针与迭代器分歧
 
 ```text
@@ -266,8 +246,6 @@ Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
   * **指针与引用（Pointers & References）依然有效**（节点实体仍在原独立堆内存上，仅链表指针重挂）。
 * **🔗 深度解析**：[iterators-and-stl-containers.md 第 4.3 节](iterators-and-stl-containers.md#43-哈希容器-rehash-后的指针与迭代器分歧)
 
----
-
 ### 2.5 `noexcept` 移动构造与 `std::move_if_noexcept` 强异常安全
 
 * **强异常安全（Strong Guarantee）契约**：操作具备事务性，若抛出异常，容器必须完整回滚到调用前的初始状态。
@@ -282,8 +260,6 @@ Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
   ```
 * **性能影响**：若自定义类的移动构造未显式标注 `noexcept`，`vector` 在扩容搬迁时为防止中途抛异常破坏旧数据，会**强制放弃移动，退化为全量深拷贝**。
 * **🔗 深度解析**：[iterators-and-stl-containers.md 第 5 章](iterators-and-stl-containers.md#5-异常安全保证与-stdmove_if_noexcept-扩容机制)
-
----
 
 ## 3. 智能指针、控制块与 RAII 资源管理
 
@@ -300,8 +276,6 @@ Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
   std::unique_ptr<FILE, decltype(&fclose)> f_buf(fopen(...), &fclose);
   ```
 * **🔗 深度解析**：[smart-pointers-and-raii.md 第 2 章](smart-pointers-and-raii.md#2-stdunique_ptr零开销独占所有权)
-
----
 
 ### 3.2 `std::shared_ptr` 控制块双计数结构与内存排布
 
@@ -328,8 +302,6 @@ std::shared_ptr<T> 句柄 (16 字节)
   * 当 `weak_ref_count` 也减至 0 时：**彻底 `free` 释放控制块自身占用的堆内存**。
 * **🔗 深度解析**：[smart-pointers-and-raii.md 第 3.1 与 3.2 节](smart-pointers-and-raii.md#3-stdshared_ptr共享所有权与控制块解密)
 
----
-
 ### 3.3 `make_shared` 单次分配 vs `shared_ptr(new T)` 弱引用滞留权衡
 
 ```text
@@ -351,8 +323,6 @@ std::shared_ptr<T> 句柄 (16 字节)
 * **`std::shared_ptr<T>(new T())`**：两次独立 `malloc`，`strong_count == 0` 时立刻单独释放 `T` 的内存。
 * **🔗 深度解析**：[smart-pointers-and-raii.md 第 3.3 节](smart-pointers-and-raii.md#33-make_shared-vs-shared_ptrnew-t-深度权衡)
 
----
-
 ### 3.4 `std::weak_ptr` 非拥有观察与原子提升 `.lock()`
 
 * **机制**：不增加 `strong_ref_count`，用于打破有向图环引用。
@@ -364,8 +334,6 @@ std::shared_ptr<T> 句柄 (16 字节)
   ```
 * **🔗 深度解析**：[smart-pointers-and-raii.md 第 4 章](smart-pointers-and-raii.md#4-stdweak_ptr非拥有观察与循环引用破除)
 
----
-
 ### 3.5 `std::enable_shared_from_this` 机制与 `bad_weak_ptr` 异常
 
 * **实现原理**：基类内部持有一个私有的 `std::weak_ptr<T> __weak_this_`，在对象首次被 `shared_ptr` 接管时由标准库构造函数自动初始化。
@@ -373,8 +341,6 @@ std::shared_ptr<T> 句柄 (16 字节)
   * 严禁直接 `shared_ptr<T>(this)`（会产生两个独立的控制块，导致同一物理地址被 `delete` 两次引发 Double Free 崩溃）；
   * 在对象未交由 `shared_ptr` 管理前调用 `shared_from_this()` 会直接抛出 **`std::bad_weak_ptr` 异常**。
 * **🔗 深度解析**：[smart-pointers-and-raii.md 第 5 章](smart-pointers-and-raii.md#5-stdenable_shared_from_this安全获取自身的-shared_ptr)
-
----
 
 ## 4. 闭包原理、递归 Lambda 与类型擦除
 
@@ -400,8 +366,6 @@ public:
   * 无捕获 `[]` $\to$ 空类（1 字节），**可隐式退化为普通函数指针 `int (*)(int)`**。
 * **🔗 深度解析**：[lambdas-closures-and-type-erasure.md 第 1 章](lambdas-closures-and-type-erasure.md#1-lambda-表达式与闭包类closure-class底层生成机制)
 
----
-
 ### 4.2 异步/延迟执行中的引用捕获悬空与广义移动捕获
 
 * **悬空崩溃**：异步分发或跨作用域回调若采用引用捕获 `[&]` 栈变量，原函数栈帧销毁后执行必导致段错误。
@@ -410,8 +374,6 @@ public:
   auto task = [buf = std::move(heap_buffer)]() { buf->process(); };
   ```
 * **🔗 深度解析**：[lambdas-closures-and-type-erasure.md 第 2 章](lambdas-closures-and-type-erasure.md#2-捕获机制与生命周期陷阱)
-
----
 
 ### 4.3 递归 Lambda 的四种解法对比
 
@@ -431,8 +393,6 @@ auto dfs = [](this auto&& self, int u) { if (u > 0) self(u - 1); };
 ```
 * **🔗 深度解析**：[lambdas-closures-and-type-erasure.md 第 3 章](lambdas-closures-and-type-erasure.md#3-递归-lambdarecursive-lambda的困境与四种解法)
 
----
-
 ### 4.4 `std::function` 类型擦除原理与 SBO 小对象优化
 
 ```text
@@ -448,15 +408,11 @@ std::function<void(int)> 外部句柄 (32 字节)
 * **SBO 机制**：若闭包体积 $\le 16 \sim 24$ 字节且支持 `noexcept` 移动，直接在栈上内联构造（**0 堆分配**）；超出体积则退化为在堆上 `malloc` 开辟存储。
 * **🔗 深度解析**：[lambdas-closures-and-type-erasure.md 第 4 章](lambdas-closures-and-type-erasure.md#4-stdfunction-底层解密类型擦除与小对象优化sbo)
 
----
-
 ### 4.5 `std::function` vs `llvm::function_ref` 零分配视图
 
 * **`std::function`**：独占拥有闭包对象，具备长生命周期拷贝/移动管理，开销较重。
 * **`llvm::function_ref`**：仅占用 **16 字节**（`void*` 对象指针 + `R(*)(void*, Args...)` 函数指针），**非拥有、纯下向借用**，**严格 0 堆内存分配**，专为编译器 Pass 内部的同步遍历优化（如 `Operation::walk`）。
 * **🔗 深度解析**：[lambdas-closures-and-type-erasure.md 第 5 章](lambdas-closures-and-type-erasure.md#5-可调用对象横向对比concrete-lambda-vs-stdfunction-vs-llvmfunction_ref)
-
----
 
 ## 5. 模板元编程、SFINAE 与 C++20 Concepts
 
@@ -468,14 +424,10 @@ std::function<void(int)> 外部句柄 (32 字节)
 * **消歧义原则**：编译器在第 1 阶段默认将 `T::nested_name` 视为静态成员变量。若要指示其为类型，**必须显式添加 `typename T::nested_name`**；若调用成员模板，必须添加 `obj.template method<U>()`。
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 1.1 节](templates-sfinae-and-concepts.md#11-两阶段名字查找two-phase-lookup与-typenametemplate-消歧义)
 
----
-
 ### 5.2 模板单一定义规则（Template ODR）与弱符号合并
 
 * 模板定义与隐式实例化可合法出现在多个 `.cpp` 编译单元中。编译器为每个实例生成弱符号（Weak Symbol），**由链接器在合并阶段自动去重保留唯一物理副本**。
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 1.2 节](templates-sfinae-and-concepts.md#12-模板单一定义规则template-odr与头文件包含模式)
-
----
 
 ### 5.3 SFINAE 原则与 `std::enable_if_t` 偏特化实现
 
@@ -487,8 +439,6 @@ std::function<void(int)> 外部句柄 (32 字节)
   ```
 * **最佳注入位置**：匿名模板参数 `template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>`。
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 2 章](templates-sfinae-and-concepts.md#2-sfinae-核心原则substitution-failure-is-not-an-error)
-
----
 
 ### 5.4 编译期成员探测：`std::void_t` 与 `std::declval`
 
@@ -503,14 +453,10 @@ std::function<void(int)> 外部句柄 (32 字节)
   ```
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 3 章](templates-sfinae-and-concepts.md#3-编译期类型萃取与成员探测type-traits--detection-idiom)
 
----
-
 ### 5.5 C++17 `if constexpr` 编译期分支修剪
 
 * **机制**：条件为 false 的分支为**废弃语句（Discarded Statement）**，编译器**完全不对其进行模板实例化**，允许在分支内书写针对特定类型才合法的代码（如指针解引用）。
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 4 章](templates-sfinae-and-concepts.md#4-c17-编译期分支修剪if-constexpr)
-
----
 
 ### 5.6 C++20 Concepts、`requires` 表达式与偏序重载
 
@@ -529,8 +475,6 @@ void print(const Iterable auto& container);
   1. 消除 SFINAE 产生的数百行深层回退报错栈，精准提示缺失的约束；
   2. **偏序重载决议（Subsumption）**：编译器自动优先命中约束更为严格（More Constrained）的 Concept 分支。
 * **🔗 深度解析**：[templates-sfinae-and-concepts.md 第 5 章](templates-sfinae-and-concepts.md#5-c20-concepts-与-requires-约束体系终极替代-sfinae)
-
----
 
 ## 6. 编译工具链、链接模型与 ELF 格式
 
@@ -551,8 +495,6 @@ void print(const Iterable auto& container);
 4. **链接（`-o`）**：链接器执行符号决议与地址重定位，合并为最终 ELF 可执行文件或 `.so`。
 * **🔗 深度解析**：[compiler-toolchain-and-elf-linking.md 第 1 章](compiler-toolchain-and-elf-linking.md#1-c-编译与工具链四大阶段流水线)
 
----
-
 ### 6.2 作用域、存储期与链接属性（Linkage）
 
 | 链接属性 | 符号表可见性 | 声明语法 |
@@ -562,8 +504,6 @@ void print(const Iterable auto& container);
 | **无链接 (No Linkage)** | 不进入链接符号表 | 函数局部变量、局部 `using` |
 
 * **🔗 深度解析**：[compiler-toolchain-and-elf-linking.md 第 2 章](compiler-toolchain-and-elf-linking.md#2-c-实体的四大管理维度作用域存储期与链接属性)
-
----
 
 ### 6.3 ELF Section 链接视图 vs Segment 装载视图与 `.bss` 机制
 
@@ -584,8 +524,6 @@ void print(const Iterable auto& container);
 * **`.bss` 零磁盘原理**：磁盘文件中**仅记录所需字节大小，不占实际磁盘文件体积**；操作系统 `execve` 装载时直接分配已清零的物理内存页。
 * **🔗 深度解析**：[compiler-toolchain-and-elf-linking.md 第 3 章](compiler-toolchain-and-elf-linking.md#3-elf-二进制格式section-与-segment-双重视图)
 
----
-
 ### 6.4 C++ Name Mangling 编码规则与 `extern "C"` 桥接
 
 * **编码机理**：C++ 为了支持重载与命名空间，遵循 Itanium ABI 将符号编码（如 `mlir::process(int, float)` $\to$ `_ZN4mlir7processEif`）。
@@ -594,15 +532,11 @@ void print(const Iterable auto& container);
   2. 建立与纯 C、Python（`ctypes`/`cffi`）或 Rust 的跨语言 ABI 桥接。
 * **🔗 深度解析**：[compiler-toolchain-and-elf-linking.md 第 4 章](compiler-toolchain-and-elf-linking.md#4-c-名字改编name-mangling与-abi-互操作)
 
----
-
 ### 6.5 全局对象 `.init_array` 构造链与 Meyers' Singleton
 
 * **main 前执行链路**：操作系统内核装载后，`__libc_start_main` 在进入 `main()` 前遍历 ELF 的 `.init_array` 节依次调用全局对象构造函数。
 * **静态初始化死锁规避（Meyers' Singleton）**：不同 `.cpp` 间的全局对象构造顺序未定义；将全局变量改为局部静态变量（`static Context instance;`），C++11 保证其在**首次使用时（On-first-use）线程安全地懒加载初始化**。
 * **🔗 深度解析**：[compiler-toolchain-and-elf-linking.md 第 5 章](compiler-toolchain-and-elf-linking.md#5-全局对象的生命周期init_array-与-main-前执行机制)
-
----
 
 ### 6.6 静态库单遍扫描算法与命令行链接顺序敏感性
 

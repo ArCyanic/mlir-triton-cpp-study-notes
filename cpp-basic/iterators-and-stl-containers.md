@@ -2,8 +2,6 @@
 
 > 本文系统解构 C++ 标准模板库（STL）的**四层抽象设计**、迭代器概念体系（C++20 Iterator Concepts 与 `iterator_traits`）、**顺序与关联容器的底层物理内存排布**、**迭代器/指针/引用失效矩阵**，以及 `std::move_if_noexcept` 在维持**强异常安全保证（Strong Exception Guarantee）**中的核心机制。
 
----
-
 ## 目录
 
 - [1. STL 四层抽象架构](#1-stl-四层抽象架构)
@@ -25,8 +23,6 @@
   - [5.1 异常安全三大层级](#51-异常安全三大层级)
   - [5.2 `move_if_noexcept` 扩容回滚](#52-move_if_noexcept-扩容回滚)
 - [6. 容器特性与失效速查表](#6-容器特性与失效速查表)
-
----
 
 ## 1. STL 四层抽象架构
 
@@ -57,8 +53,6 @@
 
 * **核心解耦逻辑**：`std::sort` 并不认识 `std::vector`，它只要求迭代器满足 **随机访问能力（Random Access）**；`std::list` 无法调用 `std::sort`，并非因为容器受到特例排斥，而是其迭代器仅具备 **双向访问能力（Bidirectional）**。
 
----
-
 ### 1.2 迭代器能力层级链
 
 在 C++20 之前，能力层级通过 Tag 结构体区分；C++20 起通过标准 Concepts 严格定义：
@@ -87,8 +81,6 @@
 | **`std::random_access_iterator`** | `it + n`, `it[n]`, `it1 - it2`, `<`, `>` | `std::deque` |
 | **`std::contiguous_iterator`** | 满足物理连续性，`&(*(it + n)) == (&*it) + n` | `std::vector`, `std::array`, `std::string` |
 
----
-
 ## 2. 迭代器机制与 Traits 萃取
 
 ### 2.1 `iterator_traits` 五大关联类型
@@ -116,8 +108,6 @@ struct iterator_traits<T*> {
 };
 ```
 
----
-
 ### 2.2 代理引用与 `vector<bool>`
 
 C++ 标准对 `std::vector<bool>` 进行了空间特化（1 bit 存储 1 个 bool），导致其解引用无法返回真实的 `bool&`（硬件无法对单独的 bit 取物理地址）：
@@ -132,8 +122,6 @@ auto ref = vb[0]; // ref 的实际类型是 std::vector<bool>::reference (代理
 
 > [!WARNING]
 > 在编写通用模板算法时，不能假定 `*it` 返回的必定是 `value_type&`。现代 C++20 通过 `std::iter_reference_t<It>` 与 `std::indirectly_readable` 概念标准化了代理引用的处理。
-
----
 
 ## 3. STL 容器内存布局
 
@@ -153,8 +141,6 @@ std::vector<T> 控制句柄 (栈上 24 字节)
            └─────────── size() = finish - start ─────────┘
            └────────────────── capacity() = end_of_storage - start ──────────┘
 ```
-
----
 
 ### 3.2 `std::deque` 分段缓冲区
 
@@ -176,8 +162,6 @@ Buffer 2:        [ Elem 4 | Elem 5 |   |   ]
   * 头尾插入和删除具有 $O(1)$ 复杂度，且**绝不触发已有缓冲区块的物理搬迁**；
   * 下标访问 `deque[i]` 需要两次指针解引用（先查中控表定位 Buffer，再查 Buffer 内偏移），常数开销略大于 `vector`。
 
----
-
 ### 3.3 `std::list` 链表节点
 
 ```text
@@ -191,8 +175,6 @@ std::list 内存布局 (非连续节点分散在堆中)
 ```
 
 * **开销分析**：每个元素额外负担 16 字节（`prev` + `next`）的指针元数据开销，CPU 缓存局部性（Cache Locality）极差。
-
----
 
 ### 3.4 `std::unordered_map` 哈希桶
 
@@ -209,8 +191,6 @@ Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
 ```
 
 * **Rehash 机制**：当元素数量超过 `bucket_count * max_load_factor` 时，触发 Rehash：开辟更大的桶数组，重新计算所有节点的桶下标并重新挂接链表。
-
----
 
 ## 4. 迭代器失效机制
 
@@ -231,8 +211,6 @@ Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
 * **扩容插入（`size == capacity` 时 `push_back`/`insert`）**：**所有迭代器、指针、引用全部失效**；
 * **非扩容插入（`size < capacity` 时在中间 `insert`）**：插入点之前的迭代器有效，**插入点及其之后的所有迭代器/引用失效**（因元素后移）。
 
----
-
 ### 4.2 范围 for 循环修改隐患
 
 ```cpp
@@ -248,15 +226,11 @@ for (auto x : vec) {
 > [!CAUTION]
 > 范围 `for` 循环在进入循环时一次性缓存 `auto __begin = vec.begin(); auto __end = vec.end();`。循环体内对容器结构的修改会导致该遍历逻辑直接崩溃。
 
----
-
 ### 4.3 哈希容器 rehash 分歧
 
 当 `std::unordered_map` 发生 Rehash 时：
 * **迭代器（Iterators）**：**全部失效**（因为桶数组重建，遍历桶的游标完全改变）；
 * **指针与引用（Pointers & References）**：**依然有效**！因为节点实体仍然留在原来的堆地址上，仅仅是改变了桶头指针的链表指向。
-
----
 
 ## 5. 异常安全与扩容保证
 
@@ -265,8 +239,6 @@ for (auto x : vec) {
 1. **基本异常保证（Basic Guarantee）**：抛出异常后，无内存泄漏，容器仍处于合法但未指定（Valid but Unspecified）的状态。
 2. **强异常安全保证（Strong Guarantee / Commit-or-rollback）**：**操作具备事务性**。若抛出异常，整个容器状态完全回滚到操作调用之前的原样。
 3. **不抛异常保证（Nothrow Guarantee）**：操作绝不抛出任何异常（标记为 `noexcept`）。
-
----
 
 ### 5.2 `move_if_noexcept` 扩容回滚
 
@@ -297,8 +269,6 @@ using move_if_noexcept_t = std::conditional_t<
 
 > [!IMPORTANT]
 > **工业级性能准则**：自定义类型若定义了移动构造函数，**必须显式添加 `noexcept` 修饰符**，否则在存入 `std::vector` 等容器后，扩容操作会完全丧失移动语义带来的性能优势。
-
----
 
 ## 6. 容器特性与失效速查表
 

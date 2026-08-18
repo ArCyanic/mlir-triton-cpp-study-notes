@@ -2,8 +2,6 @@
 
 > 本文系统剖析现代编译器中用于消除重复样板代码的核心设计模式——**CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）**。以 Triton 内部 Verifier Pass 以及 TableGen 自动生成的 Pass 基类为用例，深入 C++ 不完整类型（Incomplete Type）编译期延迟实例化时序；系统拆解 `PassWrapper<PassT, BaseT>` 如何利用静态向下转型（`static_cast`）实现 `TypeID` 注入、动态深拷贝克隆（`clonePass`）与调度根约束。
 
----
-
 ## 目录
 
 - [1. CRTP 模式与静态分派](#1-crtp-模式与静态分派)
@@ -19,8 +17,6 @@
 - [4. TableGen 生成基类与 CRTP](#4-tablegen-生成基类与-crtp)
   - [4.1 PassWrapper vs TableGen 生成基类](#41-passwrapper-vs-tablegen-生成基类)
   - [4.2 声明式选项与派生实现](#42-声明式选项与派生实现)
-
----
 
 ## 1. CRTP 模式与静态分派
 
@@ -48,8 +44,6 @@ struct VerifyWarpSpecializationPartitions
 
 传统面向对象范式只能通过声明大量的 `virtual` 虚函数来强迫派生类编写样板代码；而 CRTP 模式通过**将派生类自身作为模板实参传给基类**，让基类在编译期直接捕获派生类的具体类型信息，实现通用样板的自动化静态生成。
 
----
-
 ### 1.2 虚函数分派 vs CRTP 静态分派
 
 ```
@@ -67,8 +61,6 @@ Base<Derived> ──► 编译期 static_cast<Derived*>(this) ──► 直接�
 | **内存开销** | 8 字节 `vptr` + 虚表数据段 | **0 字节额外内存开销** |
 | **执行开销** | 间接寻址 + 间接跳转（破坏内联） | **直接内联展开（无额外跳转开销）** |
 | **适用场景** | 异构对象必须放入同构容器统一管理 | 抽取通用算法样板、Trait 静态混入 |
-
----
 
 ## 2. 不完整类型与延迟实例化
 
@@ -101,8 +93,6 @@ C++ 标准规定：**类在声明其基类列表时，自身处于不完整类�
    - 此时 `VerifyPartitions` 已经完整定义，`sizeof(PassT)` 与构造函数均完全可用！
 ```
 
----
-
 ### 2.2 CRTP 内存布局安全边界
 
 理解延迟实例化时序，有助于明确 CRTP 基类中哪些操作是合法的：
@@ -125,8 +115,6 @@ class SafeBase {
   // DerivedT invalidMember; // 错误：field has incomplete type 'DerivedT'
 };
 ```
-
----
 
 ## 3. PassWrapper 基础设施实现
 
@@ -176,8 +164,6 @@ BaseT(TypeID::   getName() { return      classof(pass) {   clonePass() {
                                            get<PassT>();}      *static_cast<PassT*>(this));}
 ```
 
----
-
 ### 3.2 clonePass 与 static_cast
 
 在 `clonePass()` 中，核心转换语句是：
@@ -192,8 +178,6 @@ return std::make_unique<PassT>(*concretePass);
 1. **编译期继承约束**：`PassWrapper<PassT, BaseT>` 是 `PassT` 的公有直接基类，编译器在编译期已掌握完整的继承偏移动态；
 2. **0 周期指针转换**：在单继承体系下，基类子对象与派生类完整对象的起始地址严格重合（偏移量 $\Delta = 0$）。因此 `static_cast` 在汇编层面不产生任何加减法指令，直接透传 `this` 指针；
 3. **消除动态检查**：不需要调用开销较大的 `dynamic_cast`，因为 CRTP 的实例化语义保证了当前运行的 `this` 对象必定是一个合法的 `PassT` 实例。
-
----
 
 ### 3.3 BaseT 调度根约束
 
@@ -216,8 +200,6 @@ struct MyFuncPass : PassWrapper<MyFuncPass, OperationPass<func::FuncOp>> {
 ```
 
 - `OperationPass<OpT>` 在其构造函数中将 `OpT::getOperationName()` 传递给 MLIR Pass 调度管理器，使 PassManager 能够在构建流水线时直接静态校验 Pass 是否被挂载到了合法的 IR 节点上。
-
----
 
 ## 4. TableGen 生成基类与 CRTP
 
@@ -252,8 +234,6 @@ public:
   Pass::Option<int32_t> numStages{*this, "num-stages", llvm::cl::desc("Pipeline stages"), llvm::cl::init(3)};
 };
 ```
-
----
 
 ### 4.2 声明式选项与派生实现
 

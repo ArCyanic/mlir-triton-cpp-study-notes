@@ -15,8 +15,6 @@ struct VerifyWarpSpecializationPartitions
 };
 ```
 
----
-
 ## 模块地图
 
 | 序号 | 模块 | 核心问题 | 关键机制与落点 |
@@ -26,8 +24,6 @@ struct VerifyWarpSpecializationPartitions
 | **02** | [MLIR TypeID 机制与 LLVM 紧凑指针](typeid-and-tagged-pointers.md) | MLIR 怎样产生稳定类型身份，怎样比较它，为什么锚点要 8 字节对齐并能支持低位复用？ | `TypeID::get<T>()`、Resolver 作用域、显式 TypeID 宏、`PointerLikeTypeTraits`、`PointerIntPair` |
 | **03** | [CRTP 模式与 PassWrapper 基础设施](crtp-and-pass-wrapper.md) | 普通基类不知道最终派生类型时，怎样把该类型注入通用样板代码？ | `PassWrapper<PassT, BaseT>` 中依赖 `PassT` 的表达式、向下 `static_cast`、延迟实例化 |
 | **04** | [MLIR Pass 生命周期与执行状态管理](pass-lifecycle-and-state.md) | PassManager 怎样拥有和复制异构 Pass？长期配置与单次执行状态怎样分离？ | `unique_ptr<Pass>`、`Pass::clone()`、`PassExecutionState`、`threadingSibling` |
-
----
 
 ## 文档边界
 
@@ -41,8 +37,6 @@ struct VerifyWarpSpecializationPartitions
 | `Derived : Base<Derived>`、向下 `static_cast`、延迟实例化 | CRTP 模式与 PassWrapper | 把 `PassT` 当作已知的具体类型 |
 | `clone()` 两阶段复制、多线程 Sibling、`PassExecutionState` 单次执行安装 | Pass 生命周期与状态管理 | 只使用已有对象模型和 TypeID 结论 |
 
----
-
 ## 建议阅读顺序
 
 第一次阅读编译器源码时，建议依循以下顺序推进：
@@ -53,8 +47,6 @@ struct VerifyWarpSpecializationPartitions
 4. **[03. CRTP 模式与 PassWrapper](crtp-and-pass-wrapper.md)**：理解如何利用编译期派生注入消除 Pass 通用样板代码；
 5. **[04. Pass 生命周期与状态管理](pass-lifecycle-and-state.md)**：系统掌握异构 Pass 队列、多线程并行克隆与单次执行状态安装；
 6. **[05. 值类别与函数传参类型系统](../cpp-basic/value-categories-and-parameter-passing.md)**：彻底理清五大值类别、移动语义物理机制、Sink Parameter 模式与完美转发。
-
----
 
 ## 机制协作模型
 

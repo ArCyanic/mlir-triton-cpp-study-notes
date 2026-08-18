@@ -2,8 +2,6 @@
 
 > 本文系统梳理在阅读 LLVM、MLIR 以及 Triton 编译器源码（如 IR 节点定义、Pass 基础设施、ODS 生成代码）时常用的现代 C++ 语法与工程惯用法。内容包括**空基类优化（EBCO）**、**变长模板参数包**、**只读视图（`ArrayRef`/`function_ref`）**、**内存对齐与 SFINAE 编译期约束**。
 
----
-
 ## 目录
 
 - [1. 内存布局与类定义控制](#1-内存布局与类定义控制)
@@ -22,8 +20,6 @@
   - [4.1 结构化绑定](#41-结构化绑定)
   - [4.2 LLVM 迭代工具（`enumerate` / `zip`）](#42-llvm-迭代工具enumerate--zip)
 - [5. 核心语法速查表](#5-核心语法速查表)
-
----
 
 ## 1. 内存布局与类定义控制
 
@@ -60,8 +56,6 @@ public:
 
 - **核心作用**：派生类将基类的全套重载构造函数引入自己的作用域，消除了在每个具体算子类中重复编写 `LoadOp(Operation *op) : Op(op) {}` 的样板开销。
 
----
-
 ### 1.2 `alignas(8)` 内存对齐与低位保留
 
 在 64 位系统上，标准分配器通常保证内存地址满足机器字对齐。但在编译器底层（如 `TypeID::Storage`、LLVM `PointerIntPair`），为了在指针中利用空闲位（Bit Stealing）存储标记，必须显式通过 `alignas` 声明对齐契约：
@@ -82,8 +76,6 @@ struct alignas(8) TypeIDStorage {
 ```
 
 LLVM 利用这一 C++ 语法保证，在 `llvm::PointerIntPair<T*, 2, bool>` 中将指针与标志位合并存储在一个 8 字节的寄存器中，在 Pass 执行和 IR 节点中省去了海量的独立标志位字段。
-
----
 
 ### 1.3 特殊成员禁用（`= delete`）
 
@@ -107,8 +99,6 @@ public:
 ```
 
 - **编译器拦截**：任何试图对该对象进行 `std::move` 或复制的代码都会在编译期直接报错，将“内存地址终生不可变”的约束锁定在类型系统层面。
-
----
 
 ## 2. 模板元编程与 Trait 混入
 
@@ -163,8 +153,6 @@ static_assert(!LoadOp::hasTrait<OpTrait::IsCommutative>(), "LoadOp is not commut
 - **模板模具自动组装**：调用方仅需写 `LoadOp::hasTrait<OpTrait::MemRead>()`，`Op` 基类内部自动将其与当前算子类型组合为 `OpTrait::MemRead<LoadOp>`；
 - **折叠表达式（Fold Expression: `(... || ...)`）**：在编译期展开为 `(is_base_of_v<Target, MemRead<LoadOp>> || is_base_of_v<Target, OneResult<LoadOp>>)`，直接计算出常量布尔值 `true` 或 `false`。
 
----
-
 ### 2.2 空基类优化（EBCO）
 
 在 MLIR 中，很多 Traits（如 `OpTrait::MemRead`）只是用来在编译期给算子附加类型特征，并不包含任何成员变量：
@@ -204,8 +192,6 @@ LoadOp 的内存排布 (EBCO 生效)
 > [!TIP]
 > **设计价值**：EBCO 允许开发者为一个算子挂载多个 Traits，而生成的 C++ 算子句柄依然只有 8 字节，保持了与原生裸指针相同的传参和寄存器传值效率。
 
----
-
 ### 2.3 SFINAE 与 `std::enable_if_t`
 
 在 LLVM 和 MLIR 模板库中，经常需要根据传入类型的特征选择不同的函数重载或类偏特化。**SFINAE（Substitution Failure Is Not An Error）** 与 `std::enable_if_t` 是核心工具：
@@ -226,8 +212,6 @@ struct PointerLikeTypeTraits<
 ```
 
 - **逻辑本质**：当 `std::is_pointer_v<T>` 为 `false` 时，`std::enable_if_t` 无法形成合法类型，编译器不会报错，而是自动忽略该特化并尝试其他候选，从而实现了编译期的多态分发。
-
----
 
 ## 3. 零拷贝视图与函数包装
 
@@ -269,8 +253,6 @@ public:
 ```
 
 - **按值传递原则**：`ArrayRef` 和 `StringRef` 仅占用 16 字节（2 个寄存器），在函数调用中**统一按值传递（Pass by Value）**：`void verify(ArrayRef<Value> operands)`，执行效率高且不发生额外内存分配。
-
----
 
 ### 3.2 函数视图（`llvm::function_ref`）
 
@@ -317,8 +299,6 @@ function_ref<LogicalResult(OpPassManager &, Operation *)> executor = runPipeline
 > [!WARNING]
 > **生命周期约束**：`function_ref` 并不拥有传入的 Lambda。它只能在被调函数**同步执行期间**有效，严禁将其保存在长生命周期对象的成员变量中。
 
----
-
 ### 3.3 句柄转换与访问操作符
 
 MLIR 的 `OpView`、`Value`、`Type` 广泛采用了智能句柄设计，使值对象具备指针般的操作体验：
@@ -339,8 +319,6 @@ public:
 };
 ```
 
----
-
 ## 4. 迭代与结构化绑定
 
 ### 4.1 结构化绑定
@@ -357,8 +335,6 @@ for (auto [nameAttr, valueAttr] : op->getAttrDictionary()) {
   llvm::outs() << "Attribute name: " << nameAttr.strref() << "\n";
 }
 ```
-
----
 
 ### 4.2 LLVM 迭代工具（`enumerate` / `zip`）
 
@@ -388,8 +364,6 @@ for (auto [actualVal, expectedTy] : llvm::zip(operands, expectedTypes)) {
   }
 }
 ```
-
----
 
 ## 5. 核心语法速查表
 

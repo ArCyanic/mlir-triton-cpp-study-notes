@@ -2,8 +2,6 @@
 
 > 本文系统剖析 MLIR 与 Triton 编译器中 **`OpPassManager` 调度引擎** 的生命周期管理模型。从 `std::unique_ptr<Pass>` 异构类型擦除容器出发，深入多线程并行流水线（Multi-threaded Pipeline）下的**两阶段克隆（Two-Stage Cloning）**与 `threadingSibling` 诊断追踪；进而系统拆解单次执行上下文 **`PassExecutionState`** 的就地构造（`emplace`）、`PointerIntPair` 紧凑状态存储与 `function_ref` 回调的生命周期边界。
 
----
-
 ## 目录
 
 - [1. 异构 Pass 队列与所有权](#1-异构-pass-队列与所有权)
@@ -19,8 +17,6 @@
   - [3.2 `optional` 就地构造](#32-optional-就地构造)
   - [3.3 紧凑状态与回调生命周期](#33-紧凑状态与回调生命周期)
 - [4. 生命周期与状态流转矩阵](#4-生命周期与状态流转矩阵)
-
----
 
 ## 1. 异构 Pass 队列与所有权
 
@@ -56,8 +52,6 @@ std::vector<std::unique_ptr<Pass>> passes
 - **类型擦除的作用**：对外暴露统一的接口 `Pass*`，消除了上层 PassManager 对具体派生类头文件的编译期依赖；
 - **内存驻留保证**：堆上分配的具体派生类对象在整个 Pipeline 生命周期内内存地址保持稳定，数据字段完整驻留。
 
----
-
 ### 1.2 工厂构造与所有权转移
 
 在 Triton 源码中，Pass 通常通过公开的工厂函数创建并注册进 Pipeline：
@@ -81,8 +75,6 @@ auto addPassWithPartitionVerifier = [&](std::unique_ptr<Pass> pass) {
   ▼ 3. 通过 std::move(pass) 转移控制权
 OpPassManager.passes (成为该 Pass 堆内存的唯一所有者)
 ```
-
----
 
 ### 1.3 虚析构级联释放
 
@@ -110,8 +102,6 @@ delete (Pass*)ptr
 > [!CAUTION]
 > 若基类 `Pass` 未声明虚析构函数，`delete (Pass*)ptr` 将仅执行 `~Pass()`，导致派生类中的成员变量发生内存泄漏与未定义行为。
 
----
-
 ## 2. 多线程并行流水线与克隆
 
 ### 2.1 线程实例隔离
@@ -126,8 +116,6 @@ Thread 2 (处理 func_B) ──┘
 ```
 
 - **隔离约束**：**Pass 实例必须是线程隔离的**。每个工作线程持有整个 Pipeline 中所有 Pass 的一份**独立的深拷贝副本**。
-
----
 
 ### 2.2 两阶段克隆机制
 
@@ -169,8 +157,6 @@ protected:
   - 重置统计量（Pass::Statistic），保证多线程各自独立统计
 ```
 
----
-
 ### 2.3 `threadingSibling` 溯源
 
 当复制出用于多线程并行的 Sibling Pass 副本后，框架需要保留它与原始主 Pass 的溯源关系，以便在编译结束时将多线程产生的耗时数据与优化统计量汇总到主 Pipeline：
@@ -193,8 +179,6 @@ for (const std::unique_ptr<Pass> &pass : mainPipeline.passes) {
  (独立执行 func_A)                 (独立执行 func_B)
 ```
 
----
-
 ## 3. 单次执行状态（`PassExecutionState`）
 
 ### 3.1 长期配置与执行状态分离
@@ -204,8 +188,6 @@ for (const std::unique_ptr<Pass> &pass : mainPipeline.passes) {
 2. **单次动态执行状态（Transient Execution Context）**：如当前正在遍历的 `Operation*`、IR 分析缓存管理器 `AnalysisManager`、动态流水线回调函数。这些数据**仅在单次 `runOnOperation()` 执行期间有效**。
 
 若将动态 IR 指针保存在 Pass 的普通成员变量中，可能导致多线程克隆时复制失效的旧指针。
-
----
 
 ### 3.2 `optional` 就地构造
 
@@ -241,8 +223,6 @@ PassManager 调度器准备执行当前 Pass
 
 - **`emplace()` 的优势**：每次执行均在已有的 `optional` 内存槽位内**就地构造（In-place Construction）**，避免了堆内存的动态分配。
 
----
-
 ### 3.3 紧凑状态与回调生命周期
 
 `PassExecutionState` 结构体的内部实现：
@@ -274,8 +254,6 @@ if (failed(runPipeline(pm, getOperation())))
 
 - **底层机制**：`runPipeline` 内部调用了 `pipelineExecutor`。该 `function_ref` 借用了调用方栈上的 Lambda 对象（16 字节只读视图）；
 - **安全约束**：该回调**不应逃逸**出当前 `runOnOperation()` 的调用栈帧。一旦 `runOnOperation()` 返回，栈帧弹出，借用立即失效，由下一次 `emplace()` 覆盖。
-
----
 
 ## 4. 生命周期与状态流转矩阵
 

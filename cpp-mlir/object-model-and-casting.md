@@ -2,8 +2,6 @@
 
 > 本文以编译器中间表示（IR）中的典型节点——兼具通用调度与内存效果查询的 `LoadOp` 为用例，从 64 位内存字节排布、Itanium C++ ABI 虚表拓扑出发，剖析标准 C++ 多态机制的底层开销；进而推导 LLVM 为何基于 `SubclassID` 构建静态标签分发体系（`isa/cast/dyn_cast`），以及 MLIR 为何进一步演进为解耦实体与视图的 Extensible Typed Wrapper（`OpView` + `TypeID`）架构。
 
----
-
 ## 目录
 
 - [1. C++ 内存排布与虚表分派](#1-c-内存排布与虚表分派)
@@ -26,8 +24,6 @@
 - [5. 多态选型与转换决策](#5-多态选型与转换决策)
   - [5.1 多态体系特性对比](#51-多态体系特性对比)
   - [5.2 类型转换决策流](#52-类型转换决策流)
-
----
 
 ## 1. C++ 内存排布与虚表分派
 
@@ -70,8 +66,6 @@ struct LoadOp : public Operation, public MemoryEffect {
 };
 ```
 
----
-
 ### 1.2 内存排布与拓扑结构
 
 当我们在栈上或堆上分配一个 `LoadOp load(ptr)` 对象时，主流 64 位平台（遵循 Itanium C++ ABI，包括 GCC 与 Clang）会在内存中生成一个连续的 **40 字节结构体**。
@@ -101,8 +95,6 @@ struct LoadOp : public Operation, public MemoryEffect {
 3. **结构体对齐填充（Padding）**：
    - 64 位系统要求指针类型（如 `vptr` 和 `address`）按 8 字节对齐。
    - `opcode`（4B）后自动补齐 4B；`reads`（1B）后自动补齐 7B，确保后续的 `address` 指针地址严格对齐到 8 字节边界。
-
----
 
 ### 1.3 虚表结构与元数据
 
@@ -137,8 +129,6 @@ struct LoadOp : public Operation, public MemoryEffect {
     $$\text{CompleteObjectPtr} = \text{CurrentSubobjectPtr} + \text{vptr}[-2]$$
 - **`typeinfo pointer`（类型信息指针）**：
   - 存放在 `vptr[-1]` 位置，指向编译器生成的 `std::type_info` 派生描述符（在包含继承关系时为 `__vmi_class_type_info`），包含基类拓扑图与访问控制权限。
-
----
 
 ### 1.4 指针转换与 Thunk 机制
 
@@ -221,8 +211,6 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 > 2. **执行间接性**：虚函数调用必须经历“读 vptr $\rightarrow$ 读槽位 $\rightarrow$ 执行 Thunk $\rightarrow$ 跳入目标函数”的多次内存解引用，彻底粉碎了编译器内联优化（Inlining）的可能；
 > 3. **RTTI 寻路开销**：`dynamic_cast` 涉及遍历继承图的深搜操作，在频繁调用的编译器遍历 Passes 中构成了不可忽视的吞吐瓶颈。
 
----
-
 ## 2. 编译器放弃原生多态的动因
 
 ### 2.1 内存与缓存开销
@@ -238,8 +226,6 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
                          └─────────────── 27B 纯元数据与填充 ───────────────┘  └─ 13B 有效 ─┘
 ```
 
----
-
 ### 2.2 间接调用与内联阻碍
 
 1. **分支预测惩罚（Indirect Branch Penalty）**：
@@ -248,8 +234,6 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
 2. **内联受阻（The Inlining Barrier）**：
    - 编译器的核心优化之一是**函数内联（Inlining）**——只有将小函数展开到调用点，才能进一步触发常量折叠、死代码消除等分析。
    - 虚函数在编译期由于动态目标未定，通常无法直接内联，限制了后续优化。
-
----
 
 ### 2.3 动态库符号与 -fno-rtti
 
@@ -260,8 +244,6 @@ MemoryEffect *effect = dynamic_cast<MemoryEffect*>(op);// 转换为 0x1010
   - 跨动态库传递指针时，地址对比 `&typeid(*op) == &typeid(LoadOp)` 可能判定为不相等；标准库的 `dynamic_cast` 被迫退化为**调用 `strcmp(typeinfo->name)` 进行慢速字符串比较**。
 - **全局配置：`-fno-rtti`**：
   - LLVM 官方在全项目中强制开启 `-fno-rtti`，不仅缩减最终二进制体积，杜绝 RTTI 字符串比较的性能隐患，更驱动设计出了一套**静态标签类型体系**。
-
----
 
 ## 3. LLVM 标签多态（SubclassID / classof）
 
@@ -310,8 +292,6 @@ public:
 #### 内存紧凑性收益
 
 在 LLVM 中，`LoadInst` 的对象内存布局中**不存在任何虚表指针**。对象的首地址既是 `Value` 的首地址，也是 `Instruction` 和 `LoadInst` 的首地址。`SubclassID` 仅占 1 字节，与其他位域字段紧凑打包在头部 8 字节中，将内存元数据开销压低到了极致。
-
----
 
 ### 3.2 classof 契约与区间编码
 
@@ -383,8 +363,6 @@ cmpq    $InstructionValRange, %rax ; 一次无符号比对即判定是否在区�
 setbe   %al                   ; 0 周期内完成判定
 ```
 
----
-
 ### 3.3 LLVM Cast 分发流水线
 
 基于 `classof` 静态契约，LLVM 构建了现代化的模板分发流水线。在底层，所有公共接口统一委托给模板适配器 `llvm::CastInfo<To, From>`：
@@ -447,8 +425,6 @@ void processInstruction(llvm::Instruction *inst) {
 | **内存开销** | 较高（虚基类引入指针与 Padding） | **0 额外内存开销**（零虚表） |
 | **工程配置依赖** | 强依赖编译器默认 RTTI 支持 | **完全兼容 `-fno-rtti`**（编译器首选） |
 
----
-
 ## 4. MLIR 句柄架构与 TypeID
 
 ### 4.1 封闭枚举的扩展局限
@@ -470,8 +446,6 @@ LLVM 模式 (封闭继承树)                   MLIR 模式 (无限方言插件�
 2. **中心化编译依赖的破坏**：若每次新增一个 Dialect 都需要修改核心基类的头文件并全量重编译 LLVM，整个编译器的模块化解耦将被彻底摧毁。
 
 为此，MLIR 彻底抛弃了“C++ 物理继承映射 IR 节点”的传统思路，开创了 **Extensible Handle-Body（实体与句柄彻底解耦）架构**。
-
----
 
 ### 4.2 实体与视图解耦（OpView）
 
@@ -531,8 +505,6 @@ public:
 #### 按值传递（Pass by Value）的最佳实践
 
 由于 `LoadOp` 内部仅包含一个 8 字节指针，它在 C++ 函数之间**按值传递**（`void process(LoadOp op)`）的开销与传递原生指针完全等同，但彻底消除了冗长的解引用操作，体验如同普通值对象（类似 `std::string_view`）。
-
----
 
 ### 4.3 TypeID 与 AbstractOperation 分发
 
@@ -605,8 +577,6 @@ void analyzeOperation(mlir::Operation *op) {
 }
 ```
 
----
-
 ## 5. 多态选型与转换决策
 
 ### 5.1 多态体系特性对比
@@ -620,8 +590,6 @@ void analyzeOperation(mlir::Operation *op) {
 | **分发与转换机制** | 查虚表 + `dynamic_cast` 继承图搜索 | `classof` 静态枚举区间比较 | `TypeID` 地址比对 + Concept Map 查表 |
 | **生态扩展性** | 封闭（需提前定义完整继承树） | 封闭（需在中心枚举中预留区段） | **开放（支持动态 Dialect 插件化扩展）** |
 | **`-fno-rtti` 兼容** | ❌ 依赖 RTTI | ✅ **完全兼容** | ✅ **完全兼容** |
-
----
 
 ### 5.2 类型转换决策流
 
@@ -652,5 +620,3 @@ void analyzeOperation(mlir::Operation *op) {
 > - **C++ 经典面向对象**：*以类为本位*，数据与方法紧耦合，依靠虚表指针实现动态多态，代价是虚指针开销与间接调用；
 > - **LLVM 体系**：*以编译期吞吐为本位*，保留继承但移除虚表，依靠 1 字节静态枚举标签与 `classof` 实现静态内联与高效转换；
 > - **MLIR 体系**：*以生态扩展为本位*，彻底拆分实体（`Operation`）与接口句柄（`OpView`），依靠 8 字节 `TypeID` 内存地址比对实现多方言扩展。
-
-

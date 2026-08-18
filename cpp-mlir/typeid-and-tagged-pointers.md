@@ -2,8 +2,6 @@
 
 > 本文系统剖析 MLIR 中无 RTTI 约束下的类型身份系统 **`TypeID`**，以及 LLVM 中利用内存对齐实现的 **紧凑指针（Tagged Pointer / Bit Stealing）** 机制。从静态局部变量唯一内存地址的实现机制出发，分析跨编译单元与动态库下的 Resolver 作用域策略；进而拆解 `PointerLikeTypeTraits`、`PointerIntPair` 与 `PointerUnion` 如何利用指针低位空闲空间实现紧凑状态存储。
 
----
-
 ## 目录
 
 - [1. TypeID 身份模型与作用域](#1-typeid-身份模型与作用域)
@@ -20,8 +18,6 @@
 - [4. 跨模块链接与调试](#4-跨模块链接与调试)
   - [4.1 跨 DSO 静态锚点排查](#41-跨-dso-静态锚点排查)
   - [4.2 紧凑指针调试流](#42-紧凑指针调试流)
-
----
 
 ## 1. TypeID 身份模型与作用域
 
@@ -58,8 +54,6 @@ TypeID::get<PassB>() ──► 内存地址: 0x55aa0108 (PassB 的静态锚点) 
 ```
 
 - **类型比对开销**：判定两个类型是否相等，底层直接编译为一条 `cmp %rax, %rbx` 汇编指令，耗时为单个 CPU 时钟周期。
-
----
 
 ### 1.2 跨编译单元作用域策略
 
@@ -109,8 +103,6 @@ mlir::TypeIDAllocator dynamicAllocator;
 mlir::TypeID dynamicOpID = dynamicAllocator.allocate();
 ```
 
----
-
 ### 1.3 Pass 句柄身份保存与 classof
 
 在 Triton 与 MLIR 的 Pass 调度中，所有具体 Pass 都被收束为基类指针 `Pass *`。基类 `Pass` 在构造时捕获该身份，派生类通过 `classof` 谓词完成类型消费：
@@ -145,8 +137,6 @@ void inspect(const Pass *pass) {
 }
 ```
 
----
-
 ## 2. 指针位复用与 TypeTraits
 
 ### 2.1 内存对齐与低位空闲空间
@@ -168,8 +158,6 @@ void inspect(const Pass *pass) {
 | `alignas(4)` / 32-bit int | 4 Bytes ($2^2$) | **2 Bits** | 4 个状态（整数 0~3 或 2 个布尔值） |
 | `alignas(8)` / 64-bit 指针 / TypeID | 8 Bytes ($2^3$) | **3 Bits** | 8 个状态（整数 0~7 或 3 个布尔值） |
 | `alignas(16)` | 16 Bytes ($2^4$) | **4 Bits** | 16 个状态（整数 0~15 或 4 个布尔值） |
-
----
 
 ### 2.2 PointerLikeTypeTraits 适配
 
@@ -194,8 +182,6 @@ struct PointerLikeTypeTraits<mlir::TypeID> {
 };
 }
 ```
-
----
 
 ## 3. LLVM 紧凑数据结构
 
@@ -240,8 +226,6 @@ Operation *op = irAndPassFailed.getPointer();
 bool failed = irAndPassFailed.getInt();
 ```
 
----
-
 ### 3.2 PointerUnion 判别联合体
 
 在 IR 体系中，一个操作数（`Operand`）可能是一个 SSA `Value*`，也可能是一个静态 `Block*`。标准 C++ 的 `std::variant<Value*, Block*>` 占用 16 字节。
@@ -268,8 +252,6 @@ if (auto type = storage.dyn_cast<mlir::Type>()) {
 }
 ```
 
----
-
 ### 3.3 掩码位运算与指令效率
 
 `PointerIntPair` 与 `PointerUnion` 的所有读写操作均在编译期被内联折叠为极简的 CPU 位运算：
@@ -294,8 +276,6 @@ andq    $7, %rax              ; 7 即 0b111
 
 - **Cache 友好性**：数据结构体积从 16 字节压缩到 8 字节，使单条 CPU 缓存行（Cache Line，64 字节）能容纳的元素数量增加，同时减少了结构体成员的间接寻址。
 
----
-
 ## 4. 跨模块链接与调试
 
 ### 4.1 跨 DSO 静态锚点排查
@@ -314,8 +294,6 @@ libB.so: TypeID::get<MyType>() ──► 0x7fff_bbb0 (libB 中的静态锚点) �
 1. **公开跨模块类型**：避免在公开头文件中使用 `MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID`；
 2. **使用显式声明导出**：头文件使用 `MLIR_DECLARE_EXPLICIT_TYPE_ID(MyType)`，并在唯一的 `.cpp` 中定义 `MLIR_DEFINE_EXPLICIT_TYPE_ID(MyType)`，交由动态链接器完成全局符号合并；
 3. **启用 Fallback 模式**：若构建系统限制符号导出，可配置 `MLIR_USE_FALLBACK_TYPE_IDS`，按类型名称全局唯一化。
-
----
 
 ### 4.2 紧凑指针调试流
 

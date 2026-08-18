@@ -1,46 +1,10 @@
-# MLIR 核心学习笔记
+# MLIR 核心架构与底层机制解析
 
-> 本笔记整理自 MLIR / LLVM 体系核心机制的深度探讨与实战推演（以 MLIR Toy 教程为主线），覆盖基础抽象、重写规则、函数内联、方言降级、符号系统与底层内存模型。
+> 本笔记整理自 MLIR / LLVM 体系核心机制的深度探讨与架构推演（以 MLIR Toy 教程为主线），覆盖基础抽象、重写规则、函数内联、方言降级、符号系统与底层内存模型。
 
----
+## 1. MLIR 核心算子抽象模型
 
-## 目录
-
-- [1. MLIR 基础与算子模型](#1-mlir-基础与算子模型)
-  - [1.1 `Operation` 与 `Op` 的双重抽象设计](#11-operation-与-op-的双重抽象设计)
-  - [1.2 算子的 `Pure` 特性与死代码消除（DCE）](#12-算子的-pure-特性与死代码消除dce)
-  - [1.3 精细化副作用建模：`MemoryEffectOpInterface`](#13-精细化副作用建模memoryeffectopinterface)
-- [2. DRR 声明式重写规则与 DAG 类型体系](#2-drr-声明式重写规则与-dag-类型体系)
-  - [2.1 DRR 体系架构与生命周期](#21-drr-体系架构与生命周期)
-  - [2.2 `Pattern` 基类与 `Pat` 语法糖](#22-pattern-基类与-pat-语法糖)
-  - [2.3 `dag` 类型系统与 S-表达式语法](#23-dag-类型系统与-s-表达式语法)
-  - [2.4 实战：常量折叠（Constant Folding）与底层替换机制](#24-实战常量折叠constant-folding与底层替换机制)
-- [3. 函数内联机制（Inlining 与 DialectInlinerInterface）](#3-函数内联机制inlining-与-dialectinlinerinterface)
-  - [3.1 跨函数优化痛点与 Interface 解耦设计](#31-跨函数优化痛点与-interface-解耦设计)
-  - [3.2 Inliner 协议交互与 IR 演变实战](#32-inliner-协议交互与-ir-演变实战)
-  - [3.3 双重安全把关：`isLegalToInline` 深度解析](#33-双重安全把关islegaltoinline-深度解析)
-- [4. 方言转换与降级框架（Dialect Conversion）](#4-方言转换与降级框架dialect-conversion)
-  - [4.1 算子降级实战：TransposeOpLowering](#41-算子降级实战transposeoplowering)
-  - [4.2 `OpConversionPattern` 架构与核心三要素](#42-opconversionpattern-架构与核心三要素)
-  - [4.3 插入点机制与 `replaceOp` 底层生命周期](#43-插入点机制与-replaceop-底层生命周期)
-  - [4.4 转换驱动与 IR 树递归遍历](#44-转换驱动与-ir-树递归遍历)
-- [5. 符号系统、LLVM 方言桥接与 RAII 光标保护](#5-符号系统llvm-方言桥接与-raii-光标保护)
-  - [5.1 全局符号机制与 SymbolTable 管理](#51-全局符号机制与-symboltable-管理)
-  - [5.2 全局辅助函数按需声明实战（`getOrInsertPrintf`）](#52-全局辅助函数按需声明实战getorinsertprintf)
-  - [5.3 RAII 光标保护机制：`InsertionGuard`](#53-raii-光标保护机制insertionguard)
-  - [5.4 编译上下文、类型解耦与 Builder 继承树](#54-编译上下文类型解耦与-builder-继承树)
-- [6. 语法解析、内存模型与 TableGen 声明式类型系统](#6-语法解析内存模型与-tablegen-声明式类型系统)
-  - [6.1 模式注入与编译期指针设计（`RewritePatternSet` 与 `&getContext`）](#61-模式注入与编译期指针设计rewritepatternset-与-getcontext)
-  - [6.2 Parser 语法解析与 `ParseResult` 短路设计](#62-parser-语法解析与-parseresult-短路设计)
-  - [6.3 句柄-实体分离与 `StructTypeStorage` 五大核心结构](#63-句柄-实体分离与-structtypestorage-五大核心结构)
-  - [6.4 底层内存哲学：Arena 内存池与 `BumpPtrAllocator`](#64-底层内存哲学arena-内存池与-bumpptrallocator)
-  - [6.5 TableGen ODS 声明式类型定义与代码生成](#65-tablegen-ods-声明式类型定义与代码生成)
-
----
-
-## 1. MLIR 基础与算子模型
-
-### 1.1 `Operation` 与 `Op` 的双重抽象设计
+### 1.1 算子双层句柄架构
 
 在 MLIR 的设计体系中，对算子（Operation）采用了经典且精妙的 **“实体与视图分离（Handle-Body Pattern）”** 设计模式。
 
@@ -114,11 +78,9 @@ public:
 > 1. **零内存冗余**：所有数据均存在于底层的 `Operation` 中，`Op` 仅作为 C++ 语义接口外壳。
 > 2. **语法自然**：因为内部仅有一个 8 字节指针，按值传递（`void process(AddIOp op)`）与传指针开销完全一致，但编写业务逻辑时省去了繁琐的解引用 `*` 或箭头 `->`，体验如同普通值对象（类似 `std::string_view`）。
 
----
+### 1.2 Pure 语义死代码消除
 
-### 1.2 算子的 `Pure` 特性与死代码消除（DCE）
-
-#### `Pure` 特性的本质
+#### Pure 特性的本质
 
 在 MLIR 中，`Pure`（早期版本称为 `NoSideEffect`）Trait 描述了一个算子除了产生其声明的返回值之外，**不会对程序运行环境产生任何可观测的副作用**。
 
@@ -161,9 +123,7 @@ def TransposeOp : Toy_Op<"transpose", [Pure]> {
 4. **跨线程/硬件通道通信算子**（如 `async.send %tensor`、`channel.write %tensor`）：
    - 将 Tensor 发送至 GPU 队列或网络通道，具有显式的系统级通信副作用。
 
----
-
-### 1.3 精细化副作用建模：`MemoryEffectOpInterface`
+### 1.3 内存副作用接口建模
 
 当算子从高层抽象降级到硬件/内存层（如 `memref` 方言）时，简单的二元状态（`Pure` / `非 Pure`）已无法满足深度优化需求。MLIR 提供了 `MemoryEffectOpInterface` 进行细粒度副作用建模。
 
@@ -227,11 +187,9 @@ void MyCustomCopyOp::getEffects(
 2. **别名分析与指令重排（Alias Analysis & Instruction Reordering）**：若两个 Op 作用于不同的 `Value`（且分析证明无指针别名重叠），即便它们均包含 `Write` 效果，编译器仍可自由调整它们的执行顺序以最大化流水线效率。
 3. **循环不变代码外提（Loop-Invariant Code Motion, LICM）**：若循环体内的 `Read` 操作所读取的 `MemRef` 在循环内部不存在任何 `Write` 副作用，该读取指令可被安全提至循环体外部（Hoist）。
 
----
+## 2. DRR 声明式重写体系
 
-## 2. DRR 声明式重写规则与 DAG 类型体系
-
-### 2.1 DRR 体系架构与生命周期
+### 2.1 DRR 编译期流水线
 
 DRR 是建立在 LLVM TableGen DSL 之上的**元编程声明式重写框架**，专门用于通过高层声明式语法自动生成 C++ 图重写代码（`mlir::OpRewritePattern`）。
 
@@ -266,13 +224,11 @@ DRR 是建立在 LLVM TableGen DSL 之上的**元编程声明式重写框架**�
    - 生成的 C++ Pattern 被注册到 `RewritePatternSet` 中。
    - MLIR 的 `GreedyRewriteDriver`（贪婪重写驱动器）按照每个 Pattern 计算出的 `Benefit`（收益值）排序，优先应用高收益规则，并在 IR 树上递归应用，直到 IR 达到收敛（不动点）。
 
----
-
-### 2.2 `Pattern` 基类与 `Pat` 语法糖
+### 2.2 Pattern 模式重写基类
 
 在 TableGen 中，定义重写规则的核心类是 `Pattern`，而最常用的是其快捷派生类 `Pat`。
 
-#### `Pattern` 基类定义与四大参数
+#### Pattern 基类定义与四大参数
 
 ```tablegen
 class Pattern<
@@ -290,7 +246,7 @@ class Pattern<
 | `additionalConstraints` | `list<dag>` | **附加约束条件**：结构匹配之外的 C++ 逻辑谓词（如要求常量大于 0 或元素类型为 f32）。 |
 | `benefitsAdded` | `dag` | **匹配优先级**：附加收益值（如 `(addBenefit 10)`）。当多条 Pattern 同时命中同一节点时，优先执行 Benefit 最高的规则。 |
 
-#### `Pat` 快捷包装类与等价对比
+#### Pat 快捷包装类与等价对比
 
 在 MLIR 底层定义（`PatternRewriter.td`）中，`Pat` 继承自 `Pattern`：
 
@@ -317,13 +273,11 @@ def ReshapeReshapeOptPattern : Pattern<
 >;
 ```
 
----
-
-### 2.3 `dag` 类型系统与 S-表达式语法
+### 2.3 DAG 模式语法解析
 
 在 LLVM/MLIR TableGen DSL 中，`dag`（有向无环图）是最核心的数据类型，专门用来声明式描述 IR 算子语法树（AST/DAG）。
 
-#### `dag` 节点三要素
+#### dag 节点三要素
 
 `dag` 采用类似 Lisp 的 **S-表达式（S-expression）** 语法：
 
@@ -358,7 +312,7 @@ def ReshapeReshapeOptPattern : Pattern<
 > - `$res` 放在参数位置时，匹配的是算子的**操作数（Operand）**或**属性（Attribute）**。
 > - `:$res` 紧跟在算子类名后（使用冒号），绑定的是**算子实例本身（`Operation*`）**。
 
-#### `resultPatterns` 中的特种 Operator
+#### resultPatterns 中的特种 Operator
 
 在替换模式中，`dag` 的 Operator 不仅可以是具体的 MLIR Op，还可以是 TableGen 预设的辅助控制符：
 
@@ -379,7 +333,7 @@ def ReshapeReshapeOptPattern : Pattern<
    (location $res) // 强制将新 Op 的 Location 设为 $res 的 Location
    ```
 
-#### 底层代码生成：`dag` 如何展开为 C++
+#### 底层代码生成：dag 如何展开为 C++
 
 当你写下一个简单的 `dag` 重写规则时，`mlir-tblgen` 在后台展开为严谨的 C++ 命令式逻辑：
 
@@ -422,11 +376,9 @@ void rewrite(Operation *op, PatternRewriter &rewriter) {
 }
 ```
 
----
+### 2.4 常量折叠原地替换
 
-### 2.4 实战：常量折叠（Constant Folding）与底层替换机制
-
-#### 为什么需要 `NativeCodeCall` 进行常量折叠？
+#### 为什么需要 NativeCodeCall 进行常量折叠？
 
 TableGen 擅长做**算子图结构的模式匹配与拓扑替换**，但无法在编译期直接处理复杂的 C++ 数据运算（例如将一个 1D 数组的数据在二进制内存层面重排为 2D 矩阵）。
 
@@ -487,7 +439,7 @@ module {
 }
 ```
 
-#### 临界状态剖析：`replaceOp` 底层行为与死代码形成
+#### 临界状态剖析：replaceOp 底层行为与死代码形成
 
 在 Pattern Rewriting 刚刚结束、DCE 尚未介入的临界状态下，IR 中堆积了所有历史旧常量：
 
@@ -518,11 +470,9 @@ module {
 > 1. **`replaceOp` 仅处理根节点**：执行 `rewriter.replaceOp(reshapeOp, newConstantOp)` 时，仅将下游引用重定向到新常量，并销毁 `reshapeOp` 本身，**不会递归向上回溯删除上游输入节点**。
 > 2. **依赖 DCE 统一回收**：因为 `toy.constant` 声明了 `Pure` 特性，随后的 DCE Pass 遍历 Block 发现 `%0`、`%cst1`、`%cst2` 的用户列表为空且无副作用，便安全将它们一次性全部清除。
 
----
+## 3. 跨方言函数内联架构
 
-## 3. 函数内联机制（Inlining 与 DialectInlinerInterface）
-
-### 3.1 跨函数优化痛点与 Interface 解耦设计
+### 3.1 跨方言内联接口解耦
 
 #### 背景问题与跨函数优化阻断
 
@@ -558,7 +508,7 @@ MLIR 框架内置了一个通用函数内联优化 Pass（`-inline`），该 Pas
 
 为了实现算法与方言的解耦，MLIR 采用了**接口抽象（Interface）机制**：通用 Inliner 负责控制流遍历与 IR 变换框架，而具体的内联合法性判定与返回值重定向则委托给方言实现的 `DialectInlinerInterface`。
 
-#### 为什么在 C++ 虚函数重写中标记 `final`？
+#### 为什么在 C++ 虚函数重写中标记 final？
 
 ```cpp
 struct ToyInlinerInterface : public DialectInlinerInterface {
@@ -577,9 +527,7 @@ struct ToyInlinerInterface : public DialectInlinerInterface {
 > 2. **去虚拟化优化（Devirtualization）**：编译器确信无后续子类更改此行为，可绕过虚函数表（vtable）间接寻址，优化为直接调用甚至直接内联，消除多态开销。
 > 3. **代码自文档化（Self-Documenting）**：向阅读者清晰传达接口实现封顶的设计意图。
 
----
-
-### 3.2 Inliner 协议交互与 IR 演变实战
+### 3.2 Inliner 调用时序演变
 
 #### 源码场景与内联前 IR
 
@@ -658,9 +606,7 @@ toy.func @main() {
 > [!TIP]
 > **优化价值**：内联完成后，原子函数若无其他引用将被 DCE 清除；同时，`main` 函数内暴露出了确切的静态张量类型（`tensor<3x2xf64>`），消除了跨函数调用的动态形状阻断，为后续的**跨算子形状推导（Shape Inference）**和**常量折叠**提供了完整的数据流上下文。
 
----
-
-### 3.3 双重安全把关：`isLegalToInline` 深度解析
+### 3.3 内联合法性断言防线
 
 `DialectInlinerInterface` 提供了两个不同粒度的 `isLegalToInline` 重载函数，分别对应内联过程中的两道安全防线：
 
@@ -683,7 +629,7 @@ Step 2: 微观把关 逐条遍历被调函数内部指令 (Op)
 Step 3: 执行内联操作，平铺代码、建立 SSA 映射并处理 Terminator
 ```
 
-#### 宏观把关：`isLegalToInline(call, callable, ...)`
+#### 宏观把关：isLegalToInline(call, callable, ...)
 
 - **关注核心**：**调用点（Call-site）层级**。回答 *“能不能在这个特定的调用位置，把目标函数展开？”*
 - **关键参数**：
@@ -694,7 +640,7 @@ Step 3: 执行内联操作，平铺代码、建立 SSA 映射并处理 Terminato
   1. **防止递归无限展开**：若发现 `call` 所在的宿主函数与 `callable` 为同一个函数，必须返回 `false`。
   2. **特殊函数属性约束**：函数被标记了 `noinline` 属性或属于外部 C/Fortran 链接库。
 
-#### 微观把关：`isLegalToInline(op, region, ...)`
+#### 微观把关：isLegalToInline(op, region, ...)
 
 - **关注核心**：**指令（Instruction）层级**。回答 *“被调函数体内的这条指令 `op`，搬到目标区域 `region` 中是否合法？”*
 - **关键参数**：
@@ -705,17 +651,15 @@ Step 3: 执行内联操作，平铺代码、建立 SSA 映射并处理 Terminato
   1. **硬件/执行域限制（Domain Restriction）**：若被调函数内包含 GPU 专属同步指令 `gpu.barrier`，而调用者是运行在 CPU 上的普通函数，跨域搬运非法，必须返回 `false`。
   2. **嵌套结构约束**：某些特定指令只能存在于特定的父容器内（如并行算子必须包裹在 `scf.parallel` 内部）。
 
-#### 为什么 Toy 语言中可以全部 `return true`？
+#### 为什么 Toy 语言中可以全部 return true？
 
 在 Toy 语言的实现中：
 1. 语言规范不支持递归调用，也没有复杂的外链接属性，因此调用点级无需拦截。
 2. 所有的 Toy 算子均为纯 CPU 标量/张量计算，可无缝运行在任意 `toy.func` 的 Region 内，因此指令级也无需拦截。
 
----
+## 4. Dialect Conversion 降级框架
 
-## 4. 方言转换与降级框架（Dialect Conversion）
-
-### 4.1 算子降级实战：TransposeOpLowering
+### 4.1 算子模式降级机制
 
 在 MLIR Toy 教程第 5 章中，`TransposeOpLowering` 标志着程序从高层语义抽象方言（Toy Dialect）走向贴近底层硬件方言（Affine / MemRef Dialect）的关键转变。
 
@@ -742,7 +686,7 @@ Step 3: 执行内联操作，平铺代码、建立 SSA 映射并处理 Terminato
 └────────────────────────────────────────────────────────────┘
 ```
 
-#### 官方 `lowerOpToLoops` 骨架与 Lambda 解耦设计
+#### 官方 lowerOpToLoops 骨架与 Lambda 解耦设计
 
 为了避免在 `AddOp`、`MulOp`、`TransposeOp` 等各类算子降级时重复编写物理内存分配与多维循环嵌套的样板逻辑，官方实现将通用流程抽象为 `lowerOpToLoops` 骨架函数。
 
@@ -773,16 +717,14 @@ struct TransposeOpLowering : public OpConversionPattern<toy::TransposeOp> {
 };
 ```
 
-#### `llvm::reverse` 零拷贝索引翻转
+#### llvm::reverse 零拷贝索引翻转
 
 - **`loopIvs`（Loop Induction Variables）**：`lowerOpToLoops` 传给 Lambda 的当前循环迭代变量列表。对于 2 维输出矩阵，`loopIvs` 即为 `[i, j]`（代表输出矩阵的写入坐标）。
 - **`llvm::reverse(loopIvs)`**：转置的数学定义为将原矩阵 $(j, i)$ 位置的元素写入新矩阵 $(i, j)$。`llvm::reverse` 对传入的指针范围进行反向遍历并填入栈上的 `SmallVector`，**零堆内存分配**，高效完成转置寻址。
 
----
+### 4.2 转换模式三大要素
 
-### 4.2 `OpConversionPattern` 架构与核心三要素
-
-#### `OpConversionPattern` 与普通 `OpRewritePattern` 的区别
+#### OpConversionPattern 与普通 OpRewritePattern 的区别
 
 - **`OpRewritePattern`**：通常用于同一个 Dialect 内部的局部图重写与规范化（如 Canonicalize）。
 - **`OpConversionPattern`**：专门用于**跨 Dialect、跨类型系统**的方言降级。它内部绑定了 `TypeConverter`（类型转换器），能够感知整个编译环境中类型的映射关系（如自动将 `tensor<2x3xf64>` 映射为 `memref<2x3xf64>`）。
@@ -795,7 +737,7 @@ using OpConversionPattern<toy::TransposeOp>::OpConversionPattern;
 
 这是 C++11 的继承构造函数语法（`using Base::Base;`）。它的作用是直接继承父类 `OpConversionPattern` 内部已经定义好的复杂构造函数（接收 `TypeConverter&`、`MLIRContext*`、`PatternBenefit` 等框架对象），免去子类手写无意义的模板转发代码。
 
-#### `matchAndRewrite` 三大核心参数（`op` vs `adaptor` vs `rewriter`）
+#### matchAndRewrite 三大核心参数（op vs adaptor vs rewriter）
 
 ```cpp
 LogicalResult matchAndRewrite(
@@ -815,14 +757,12 @@ LogicalResult matchAndRewrite(
 > **为什么有了 `op` 还需要 `adaptor`？**
 > `op.getOperand(0)` 仅指向旧 IR 树中的节点；而 `adaptor.getOperand(0)` 自动解析了 `TypeConverter` 转换后的最新操作数指针。在 Lowering Pass 中读取输入数据时，**必须使用 `adaptor`**。
 
-#### `const final` 修饰符与 Devirtualization 优化
+#### const final 修饰符与 Devirtualization 优化
 
 - `const`：声明该 Pattern 对象的匹配重写逻辑是无状态且只读的。
 - `final`：阻止后续子类进一步重写该虚函数，帮助 C++ 编译器进行去虚拟化（Devirtualization）优化，直接消除虚函数表调用的开销。
 
----
-
-### 4.3 插入点机制与 `replaceOp` 底层生命周期
+### 4.3 插入点光标生命周期
 
 #### 插入点（Insertion Point）位置与代码生成时间线
 
@@ -839,7 +779,7 @@ LogicalResult matchAndRewrite(
 ... -> [%alloc = memref.alloc] -> [affine.for 循环群] -> [toy.print (输入重定向为 %alloc)] ...
 ```
 
-#### `replaceOp` 底层行为解构（RAUW + 节点销毁）
+#### replaceOp 底层行为解构（RAUW + 节点销毁）
 
 `replaceOp` 并不是原地文本替换，而是拆解为两个独立的底层动作：
 1. **重定向引用（RAUW: Replace All Uses With）**：遍历整个 IR 块，将所有原本将 `transpose` 输出结果（`%1`）作为输入的下游算子（如 `toy.print %1`），全部重定向为输入新内存句柄 `%alloc`。
@@ -855,9 +795,7 @@ LogicalResult matchAndRewrite(
 | `modifyOpInPlace` | ❌ | ❌（仅内部修改） | ❌ | 仅修改旧 Op 的 Operand 或 Attribute |
 | `eraseOp` | ❌ | ❌ | ✅ | 明确无用的死代码清理（需满足 UseCount == 0） |
 
----
-
-### 4.4 转换驱动与 IR 树递归遍历
+### 4.4 递归转换驱动引擎
 
 ```cpp
 void ToyToAffineLoweringPass::runOnOperation() {
@@ -867,7 +805,7 @@ void ToyToAffineLoweringPass::runOnOperation() {
 }
 ```
 
-#### `Operation` 层次树状容器结构
+#### Operation 层次树状容器结构
 
 在 MLIR 中，顶层容器（如 `ModuleOp` 或 `FuncOp`）本身就是一个 `Operation`。它通过 `Region` 和 `Block` 嵌套包含了程序中的所有子算子：
 
@@ -884,7 +822,7 @@ getOperation() 返回的根节点 (ModuleOp)
         └── toy.func (Operation) ...
 ```
 
-#### `applyPartialConversion` 深度优先遍历与目标校验
+#### applyPartialConversion 深度优先遍历与目标校验
 
 当把 `getOperation()` 传给转换驱动时，框架在底层执行以下流程：
 1. **深度优先遍历（Recursive Walk）**：以根 `Operation*` 为起点，递归遍历其内部所有的 Region、Block 和子 Operation。
@@ -899,11 +837,9 @@ getOperation() 返回的根节点 (ModuleOp)
 | **`applyFullConversion`** | **完全转换**：极其严格。转换结束后，整个 IR 树中绝对不能留有任何旧 Dialect 的算子，否则宣告失败。 | 面向 LLVM IR 或目标硬件方言的最终代码生成阶段。 |
 | **`applyAnalysisConversion`** | **仅分析不改写**：只试探性执行匹配流程，检查 IR 是否能够被成功转换，不实际修改 IR 结构。 | 用于 Pass 内部的分析与条件决策。 |
 
----
+## 5. 全局符号系统与光标控制
 
-## 5. 符号系统、LLVM 方言桥接与 RAII 光标保护
-
-### 5.1 全局符号机制与 SymbolTable 管理
+### 5.1 SymbolTable 符号解析管理
 
 MLIR 的 **Symbol 机制** 是专门用于在不同的 Operation 之间建立跨作用域名称引用（如函数调用、全局变量访问）的抽象层。为了避免直接使用 C++ 指针导致的跨区域生命周期混乱，MLIR 借由定义端、引用端与容器端三者协同工作。
 
@@ -946,9 +882,7 @@ MLIR 的 **Symbol 机制** 是专门用于在不同的 Operation 之间建立跨
 - `FlatSymbolRefAttr` 本质上是一个被包裹成属性（Attribute）的字符串。
 - 得益于 `MLIRContext` 的享元模式（Uniquing），多次调用 `SymbolRefAttr::get(context, "printf")` 都会从上下文缓存中直接返回指向同一个单例属性的轻量句柄。
 
----
-
-### 5.2 全局辅助函数按需声明实战（`getOrInsertPrintf`）
+### 5.2 外部辅助函数惰性声明
 
 在 Toy 教程第 6 章中，当要把 `toy.print` 降级为调用 C 标准库的 `printf` 时，必须确保外层 Module 中存在 `printf` 的函数声明，并返回其符号引用。
 
@@ -1009,9 +943,7 @@ C 语言标准库中的原型为 `int printf(const char *format, ...);`，在 ML
 
 > **桥接转换**：在降级 Pass 全部完成后，调用 `mlir::translateModuleToLLVMIR(mlirModule, llvmContext)` 统一将 MLIR 的 LLVM Dialect 树翻译为原生 `llvm::Module`。
 
----
-
-### 5.3 RAII 光标保护机制：`InsertionGuard`
+### 5.3 InsertionGuard 光标保护
 
 `PatternRewriter::InsertionGuard`（继承自 `OpBuilder::InsertionGuard`）利用 C++ RAII 机制管理 Rewriter 的插入游标（Insertion Point）。
 
@@ -1038,7 +970,7 @@ C 语言标准库中的原型为 `int printf(const char *format, ...);`，在 ML
   } // 离开作用域时析构，自动复位至进入前的位置
   ```
 
-#### `InsertionGuard` 的 C++ RAII 底层实现模拟
+#### InsertionGuard 的 C++ RAII 底层实现模拟
 
 ```cpp
 namespace mlir {
@@ -1068,11 +1000,9 @@ private:
 > [!TIP]
 > **局部花括号最佳实践**：可通过独立的 C++ 局部花括号 `{ PatternRewriter::InsertionGuard guard(rewriter); ... }` 精确限制 Guard 的生命周期，离开花括号后立即复位光标，无需等到整个函数结束。
 
----
+### 5.4 OpBuilder 继承体系设计
 
-### 5.4 编译上下文、类型解耦与 Builder 继承树
-
-#### `MLIRContext` 与 `ModuleOp` 的宿主从属关系
+#### MLIRContext 与 ModuleOp 的宿主从属关系
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -1090,7 +1020,7 @@ private:
 - **`ModuleOp`**：由 Context 创建并托管的 IR 顶层结构节点。`module.getContext()` 是向上查询其所属的全局上下文。
 - **数量关系**：单文件对应 1 个顶层 Module；GPU/异构编译中支持 Module 嵌套；JIT 执行引擎中可存在多个平行的独立 Module 共享同一 Context。
 
-#### 为什么 LLVM 与 MLIR 各自拥有独立的 `IntegerType`？
+#### 为什么 LLVM 与 MLIR 各自拥有独立的 IntegerType？
 
 1. **语义表达能力差异（Signedness）**：
    - LLVM `llvm::IntegerType`：**无符号特质（Signless）**，整数只有位宽（如 `i32`），正负号语义押后至算子层面（`sdiv` vs `udiv`）。
@@ -1103,7 +1033,7 @@ private:
 - **旧版 MLIR (LLVM $\le$ 14)**：带类型指针（Typed Pointers），如 `!llvm.ptr<i8>`，API 为 `LLVMPointerType::get(Type elementType)`。
 - **现代 MLIR (LLVM $\ge$ 15+)**：不透明指针（Opaque Pointers），如 `!llvm.ptr`，API 简化为 `LLVMPointerType::get(MLIRContext *context)`。彻底移除了多余的指针类型嵌套与 bitcast 开销。
 
-#### `OpBuilder` 家族单继承树与多态转换
+#### OpBuilder 家族单继承树与多态转换
 
 ```
   ┌────────────────────────┐
@@ -1125,11 +1055,7 @@ private:
 - **`PatternRewriter`（子类）**：通过内部 Listener 将修改实时通知给 `GreedyRewriteDriver` 的工作队列（Worklist），确保模式迭代收敛。
 - **多态兼容**：`InsertionGuard` 接收 `OpBuilder&`，因此在所有子类（`PatternRewriter`、`ConversionPatternRewriter`）中均可无缝直接使用。
 
----
-
-## 6. 语法解析、内存模型与 TableGen 声明式类型系统
-
-### 6.1 模式注入与编译期指针设计（`RewritePatternSet` 与 `&getContext`）
+### 5.5 模式集注册与上下文指针生命周期
 
 在 Pass 的 `runOnOperation` 中，通常会看到如下模式集合初始化与批量注入代码：
 
@@ -1147,13 +1073,13 @@ mlir::cf::populateControlFlowToLLVMConversionPatterns(patterns, &getContext());
 patterns.add<PrintOpLowering>(&getContext());
 ```
 
-#### `populate*` 批量注入范式
+#### populate* 批量注入范式
 
 - 一个完整的 Dialect（如 Affine）内部包含几十种算子（`affine.for`, `affine.if`, `affine.load`, `affine.store` 等）。
 - 若要求开发者逐一手动 `patterns.add<...>()`，会产生大量样板代码。
 - 官方库将同一转换阶段的整套规则打包为 `populate...Patterns` 函数（Idiom），供 Pass 批量注册到 `patterns` 容器中。
 
-#### 为什么传 `MLIRContext` 指针而非引用？
+#### 为什么传 MLIRContext 指针而非引用？
 
 `getContext()` 返回的是当前全局上下文的引用 `MLIRContext&`，通过 `&getContext()` 取地址转为指针 `MLIRContext*` 传给容器和模式类。
 
@@ -1165,9 +1091,9 @@ patterns.add<PrintOpLowering>(&getContext());
    - 值语义轻量句柄（如 `Type`, `Value`, `Attribute`）使用传值（By Value）或传引用（By Reference）。
    - 环境/全局大对象身份（如 `MLIRContext*`, `Operation*`, `TypeConverter*`）一律使用传指针（By Pointer），明确表达借用全局地址的意图。
 
----
+## 6. 自定义类型解析与存储架构
 
-### 6.2 Parser 语法解析与 `ParseResult` 短路设计
+### 6.1 文本解析短路状态机
 
 MLIR 中所有的文本语法解析函数均返回 `ParseResult`。
 
@@ -1177,7 +1103,7 @@ MLIR 中所有的文本语法解析函数均返回 `ParseResult`。
 // value on failure to allow for chaining...
 ```
 
-#### `ParseResult` 的短路求值设计（失败为 `true`）
+#### ParseResult 的短路求值设计（失败为 true）
 
 手写编译器的语法解析器充斥着大量顺序递进逻辑（必须依次解析类型、名称、等号、表达式，任何一步失败均需立即中断）。
 
@@ -1215,9 +1141,7 @@ Type parseStructType(AsmParser &parser) {
 - **`Type()` 的本质是空指针**：默认构造的 `Type()` 内部持有 `nullptr`，在布尔上下文中隐式转换为 `false`。
 - 上游框架通过简单的指针判空 `if (!t) return failure();` 即可感知解析状态（经典 Null Object Pattern）。
 
----
-
-### 6.3 句柄-实体分离与 `StructTypeStorage` 五大核心结构
+### 6.2 TypeStorage 存储实体抽象
 
 为了保证类型在整个编译期间**完全不可变（Immutable）且全局唯一（Uniqued）**，MLIR 将类型拆分为两层：
 
@@ -1240,7 +1164,7 @@ Type parseStructType(AsmParser &parser) {
       └────────────────────────────────────────────────────────────┘
 ```
 
-#### `StructTypeStorage` 的五大核心结构
+#### StructTypeStorage 的五大核心结构
 
 打开自定义类型的实现，其标准骨架包含五个关键组成部分：
 
@@ -1278,7 +1202,7 @@ struct StructTypeStorage : public mlir::TypeStorage {
 };
 ```
 
-#### `StructType::get` 唯一化生命周期全流程
+#### StructType::get 唯一化生命周期全流程
 
 ```
 调用 StructType::get({i32, f64})
@@ -1301,9 +1225,7 @@ struct StructTypeStorage : public mlir::TypeStorage {
 > [!TIP]
 > **性能优势**：无论在代码中调用多少次 `StructType::get(context, {i32, f64})`，返回的底层 `StructTypeStorage*` 永远指向同一个内存地址。判断两个结构体类型是否完全相同只需执行简单的**指针地址对比**（`typeA == typeB`），时间复杂度为 $O(1)$。
 
----
-
-### 6.4 底层内存哲学：Arena 内存池与 `BumpPtrAllocator`
+### 6.3 BumpPtrAllocator 内存池模型
 
 在大型编译任务中，IR 包含数以百万计的微小类型、属性和节点。传统的 `malloc/free` 或 `std::shared_ptr` 会导致大量内存碎片并产生高昂的单个析构/链表维护开销。
 
@@ -1318,7 +1240,7 @@ MLIR 采用了 **Arena 内存池 + BumpPtrAllocator + Placement New** 的协同�
                           CurPtr (每次分配仅向右“碰撞”平移 N 字节)
 ```
 
-#### `BumpPtrAllocator` 碰撞指针分配器原理
+#### BumpPtrAllocator 碰撞指针分配器原理
 
 1. **结构**：向操作系统申请若干个大型连续内存块（Slab，如 4KB 或 64KB），维护一个边界指针 `CurPtr`。
 2. **分配逻辑**：
@@ -1338,18 +1260,16 @@ void *mem = allocator.allocate(sizeof(StructTypeStorage), alignof(StructTypeStor
 StructTypeStorage *storage = new (mem) StructTypeStorage(elementTypes);
 ```
 
-#### Arena 生命周期：零单体析构与 $O(1)$ 批量释放
+#### Arena 生命周期：零单体析构与 O(1) 批量释放
 
 - **运行期间零析构**：所有的 `TypeStorage` 全局唯一且只读，运行期间从不单独调用 `delete`，无需维护复杂的引用计数或空闲链表。
 - **销毁时 $O(1)$ 批量归还**：当整个 `MLIRContext` 析构时，`BumpPtrAllocator` 将所有的 Slab 内存大块一次性整体交还给操作系统。**数以百万计对象的清理开销降为 $O(1)$**。
 
----
-
-### 6.5 TableGen ODS 声明式类型定义与代码生成
+### 6.4 ODS 声明式类型代码生成
 
 在现代 MLIR 中，无需手写上述繁琐的 `TypeStorage` 样板代码。通过 TableGen 的 ODS（Operation/Type Definition System）声明，`mlir-tblgen` 可自动生成完整的 C++ 类与存储逻辑。
 
-#### 在 TableGen (`.td`) 文件中声明 `TypeDef`
+#### 在 TableGen (.td) 文件中声明 TypeDef
 
 ```tablegen
 include "mlir/IR/AttrTypeBase.td"
@@ -1417,4 +1337,3 @@ void ToyDialect::initialize() {
 | `parameters = (ins ...)` | 私有的 `detail::StructTypeStorage` 结构体、`KeyTy` 别名、`construct()` 分配逻辑与 `hashKey()` 计算 |
 | `mnemonic` + `assemblyFormat` | 自动生成的 `StructType::parse()` 与 `StructType::print()` 解析/打印函数 |
 | `(ins ...)` 中的字段名 | 自动生成的 C++ Getter 方法（如 `structType.getElementTypes()`）与静态 `get()` 工厂函数 |
-

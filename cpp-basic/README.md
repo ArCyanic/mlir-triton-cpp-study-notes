@@ -2,8 +2,6 @@
 
 > 本目录收拢现代 C++（C++11/14/17/20/23）中**与特定编译器框架解耦的通用核心语言机制**，作为学习 `cpp-mlir` 体系的前置知识底座。内容覆盖类型系统、值类别、智能指针与控制块、闭包与类型擦除、SFINAE 与 Concepts 约束、编译工具链与 ELF 链接模型。
 
----
-
 ## 模块地图
 
 | 序号 | 模块 | 核心问题 | 关键机制与落点 |
@@ -15,8 +13,6 @@
 | **04** | [闭包、递归 Lambda 与类型擦除](lambdas-closures-and-type-erasure.md) | Lambda 编译器生成类原理？递归 Lambda 如何零开销实现？`std::function` 如何擦除类型？ | 闭包仿函数生成、广义移动捕获、Y-Combinator / Deducing this、`std::function` 虚表与 SBO 小对象优化 |
 | **05** | [模板元编程、SFINAE 与 Concepts](templates-sfinae-and-concepts.md) | 模板两阶段查找与 ODR 规则？SFINAE 如何探测成员？C++20 Concepts 如何优化编译诊断？ | 两阶段查找、`std::enable_if_t`、`std::void_t` / `declval` 探测、`if constexpr` 分支修剪、Concepts 偏序决议 |
 | **06** | [编译流水线、链接模型与 ELF](compiler-toolchain-and-elf-linking.md) | 源码到二进制经历哪四阶段？ELF 节区如何分布？Name Mangling 与静态库链接顺序为何敏感？ | 编译四阶段、链接属性（External/Internal）、ELF Section/Segment、`extern "C"`、`.init_array` 构造链、单遍扫描算法 |
-
----
 
 ## 知识分层与关联导航
 
