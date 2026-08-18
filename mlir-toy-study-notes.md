@@ -191,11 +191,9 @@ void MyCustomCopyOp::getEffects(
 
 ### 2.1 DRR 编译期流水线
 
-DRR 是建立在 LLVM TableGen DSL 之上的**元编程声明式重写框架**，专门用于通过高层声明式语法自动生成 C++ 图重写代码（`mlir::OpRewritePattern`）。
+DRR 是建立在 LLVM TableGen DSL 之上的**元编程声明式重写框架**，专门用于通过高层声明式语法自动生成 C++ 图重写代码（`mlir::OpRewritePattern`）。其核心哲学在于：**用声明式树模式描述取代手写冗长、脆弱且易错的 C++ 图遍历与指针替换逻辑**。
 
-它的核心哲学是：**用声明式树模式描述取代手写冗长、脆弱且易错的 C++ 图遍历与指针替换逻辑。**
-
-```
+```text
 ┌───────────────────────────────┐
 │ 1. DSL 声明阶段 (.td 文件)     │ 开发者使用 TableGen DAG (S-expression) 声明匹配与替换规则
 └──────────────┬────────────────┘
@@ -211,18 +209,11 @@ DRR 是建立在 LLVM TableGen DSL 之上的**元编程声明式重写框架**�
 └───────────────────────────────┘
 ```
 
-#### DRR 的三大生命周期阶段
+DRR 的完整工作流包含三大严密衔接的生命周期阶段：
 
-1. **DSL 声明阶段（`.td` 文件）**：
-   - 开发者使用 Lisp 风格的 S-表达式（S-expression）编写模式匹配和结果替换。
-   - 语法形式形如：`(OpName $arg1, (ChildOp $arg2))`。
-2. **代码生成阶段（`mlir-tblgen`）**：
-   - 构建系统调用 `mlir-tblgen -gen-rewriters` 解析 `.td`，生成对应的 `.inc` C++ 代码。
-   - **匹配逻辑自动展开**：将源模式展开为一连串的 `isa<...>`、`dyn_cast<...>`、操作数提取及类型检查。
-   - **重写逻辑自动展开**：将结果模式展开为 `rewriter.create<...>()` 与 `rewriter.replaceOp()`。
-3. **驱动执行阶段（Pattern Driver）**：
-   - 生成的 C++ Pattern 被注册到 `RewritePatternSet` 中。
-   - MLIR 的 `GreedyRewriteDriver`（贪婪重写驱动器）按照每个 Pattern 计算出的 `Benefit`（收益值）排序，优先应用高收益规则，并在 IR 树上递归应用，直到 IR 达到收敛（不动点）。
+1. **DSL 声明阶段（`.td` 文件）**：开发者使用 Lisp 风格的 S-表达式（S-expression）编写模式匹配和结果替换，语法形式如 `(OpName $arg1, (ChildOp $arg2))`。
+2. **代码生成阶段（`mlir-tblgen`）**：构建系统调用 `mlir-tblgen -gen-rewriters` 解析 `.td`，生成对应的 `.inc` C++ 代码。TableGen 自动将源模式展开为一连串的 `isa<...>`、`dyn_cast<...>`、操作数提取及类型检查，并将结果模式展开为 `rewriter.create<...>()` 与 `rewriter.replaceOp()`。
+3. **驱动执行阶段（Pattern Driver）**：生成的 C++ Pattern 被批量注册到 `RewritePatternSet` 中。MLIR 的 `GreedyRewriteDriver`（贪婪重写驱动器）按照每个 Pattern 声明的 `Benefit`（收益值）排序，优先应用高收益规则，并在 IR 树上递归迭代，直到 IR 状态达到收敛（不动点）。
 
 ### 2.2 Pattern 模式重写基类
 
@@ -729,7 +720,7 @@ struct TransposeOpLowering : public OpConversionPattern<toy::TransposeOp> {
 - **`OpRewritePattern`**：通常用于同一个 Dialect 内部的局部图重写与规范化（如 Canonicalize）。
 - **`OpConversionPattern`**：专门用于**跨 Dialect、跨类型系统**的方言降级。它内部绑定了 `TypeConverter`（类型转换器），能够感知整个编译环境中类型的映射关系（如自动将 `tensor<2x3xf64>` 映射为 `memref<2x3xf64>`）。
 
-#### C++11 `using` 继承构造函数机制
+#### C++11 using 继承构造函数机制
 
 ```cpp
 using OpConversionPattern<toy::TransposeOp>::OpConversionPattern;
@@ -1337,3 +1328,4 @@ void ToyDialect::initialize() {
 | `parameters = (ins ...)` | 私有的 `detail::StructTypeStorage` 结构体、`KeyTy` 别名、`construct()` 分配逻辑与 `hashKey()` 计算 |
 | `mnemonic` + `assemblyFormat` | 自动生成的 `StructType::parse()` 与 `StructType::print()` 解析/打印函数 |
 | `(ins ...)` 中的字段名 | 自动生成的 C++ Getter 方法（如 `structType.getElementTypes()`）与静态 `get()` 工厂函数 |
+

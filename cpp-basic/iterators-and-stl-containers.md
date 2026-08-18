@@ -1,133 +1,140 @@
-# STL 容器、迭代器与异常安全
+# STL 容器架构与迭代器模型
 
-> 本文系统解构 C++ 标准模板库（STL）的**四层抽象设计**、迭代器概念体系（C++20 Iterator Concepts 与 `iterator_traits`）、**顺序与关联容器的底层物理内存排布**、**迭代器/指针/引用失效矩阵**，以及 `std::move_if_noexcept` 在维持**强异常安全保证（Strong Exception Guarantee）**中的核心机制。
+> 本文系统解构 C++ 标准模板库（STL）的四层正交解耦架构、迭代器五级能力概念与 C++20 哨兵机制、顺序与哈希容器的底层物理内存排布、`std::vector` 几何扩容数学推导与 `llvm::SmallVector` 栈上小对象优化、动态扩容与删除操作（Erase-Remove）引发的迭代器失效边界、`std::move_if_noexcept` 事务性强异常安全保证，并给出高性能编译器场景下的容器选型决策全景。
 
-## 目录
+---
 
-- [1. STL 四层抽象架构](#1-stl-四层抽象架构)
-  - [1.1 算法与容器正交解耦](#11-算法与容器正交解耦)
-  - [1.2 迭代器能力层级链](#12-迭代器能力层级链)
-- [2. 迭代器机制与 Traits 萃取](#2-迭代器机制与-traits-萃取)
-  - [2.1 `iterator_traits` 五大关联类型](#21-iterator_traits-五大关联类型)
-  - [2.2 代理引用与 `vector<bool>`](#22-代理引用与-vectorbool)
-- [3. STL 容器内存布局](#3-stl-容器内存布局)
-  - [3.1 `std::vector` 三指针模型](#31-stdvector-三指针模型)
-  - [3.2 `std::deque` 分段缓冲区](#32-stddeque-分段缓冲区)
-  - [3.3 `std::list` 链表节点](#33-stdlist-链表节点)
-  - [3.4 `std::unordered_map` 哈希桶](#34-stdunordered_map-哈希桶)
-- [4. 迭代器失效机制](#4-迭代器失效机制)
-  - [4.1 连续内存容器失效](#41-连续内存容器失效)
-  - [4.2 范围 for 循环修改隐患](#42-范围-for-循环修改隐患)
-  - [4.3 哈希容器 rehash 分歧](#43-哈希容器-rehash-分歧)
-- [5. 异常安全与扩容保证](#5-异常安全与扩容保证)
-  - [5.1 异常安全三大层级](#51-异常安全三大层级)
-  - [5.2 `move_if_noexcept` 扩容回滚](#52-move_if_noexcept-扩容回滚)
-- [6. 容器特性与失效速查表](#6-容器特性与失效速查表)
+## 1. STL 正交解耦与迭代器概念体系
 
-## 1. STL 四层抽象架构
+### 1.1 算法容器四层正交解耦模型
 
-### 1.1 算法与容器正交解耦
-
-标准模板库（STL）通过四层正交结构，消除了 $M$ 个算法与 $N$ 个容器组合产生的 $M \times N$ 代码膨胀：
+标准模板库（STL）的核心设计哲学是**泛型编程与正交解耦（Orthogonal Decoupling）**。通过引入迭代器作为算法与容器之间的通用抽象媒介，成功避免了 $M$ 个算法与 $N$ 个容器组合产生的 $M \times N$ 代码膨胀危机，将其复杂度降解为 $M + N$：
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. 算法层 (Algorithms)    : std::sort, std::find, std::copy │
+│─────────────────────────────────────────────────────────────│
+│    通过迭代器区间操作数据，不感知容器具体实现与内存拓扑         │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ 依赖抽象能力 (区间访问)
+                               │ 依赖抽象能力 (通过迭代器遍历数据)
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. 迭代器层 (Iterators)   : 概念 (Concepts) / Traits 萃取   │
+│─────────────────────────────────────────────────────────────│
+│    泛化指针行为，充当算法与容器交互的黏合剂                   │
 └──────────────────────────────┬──────────────────────────────┘
                                │ 映射底层结构 (产出遍历迭代器)
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. 容器层 (Containers)    : vector, deque, list, map        │
+│─────────────────────────────────────────────────────────────│
+│    负责元素物理组织、数据结构拓扑与生命周期维护               │
 └──────────────────────────────┬──────────────────────────────┘
                                │ 申请/释放底层存储
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 4. 内存分配层 (Allocators): std::allocator, std::pmr        │
+│─────────────────────────────────────────────────────────────│
+│    将裸物理内存的申请/释放与对象的就地构造/析构彻底解耦       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-* **核心解耦逻辑**：`std::sort` 并不认识 `std::vector`，它只要求迭代器满足 **随机访问能力（Random Access）**；`std::list` 无法调用 `std::sort`，并非因为容器受到特例排斥，而是其迭代器仅具备 **双向访问能力（Bidirectional）**。
+`std::sort` 并不关心数据是存储在 `std::vector`、`std::array` 还是原生 C 数组中，它仅仅要求传入的迭代器满足**随机访问能力（Random Access Iterator）**；而 `std::list` 无法调用 `std::sort`，并非容器受到排斥，而是其物理链表结构只能提供**双向迭代器（Bidirectional Iterator）**，无法满足快速排序和内省排序对 $O(1)$ 随机跳跃寻址的强硬数学要求。
 
-### 1.2 迭代器能力层级链
+---
 
-在 C++20 之前，能力层级通过 Tag 结构体区分；C++20 起通过标准 Concepts 严格定义：
+### 1.2 迭代器能力层级与编译期算法分派
+
+在 C++20 之前，迭代器能力层级通过 Tag 结构体（如 `std::random_access_iterator_tag`）进行区分；C++20 起通过标准 Concepts 严格定义五级继承体系：
 
 ```text
-               Input Iterator (输入，单向单遍读取 single-pass)
-                     │
-                     ▼
-              Forward Iterator (前向，多遍读取与可重入遍历 multi-pass)
-                     │
-                     ▼
-           Bidirectional Iterator (双向，支持 operator--)
-                     │
-                     ▼
-           Random Access Iterator (随机访问，O(1) 常数时间 it + n / it - n)
-                     │
-                     ▼
-            Contiguous Iterator (连续迭代器，逻辑连续严格对应物理连续内存)
+               Input Iterator (输入迭代器，单向单遍扫描 single-pass)
+                      │
+                      ▼
+               Forward Iterator (前向迭代器，多遍重入与可保存遍历 multi-pass)
+                      │
+                      ▼
+            Bidirectional Iterator (双向迭代器，支持逆向移动 operator--)
+                      │
+                      ▼
+            Random Access Iterator (随机访问迭代器，O(1) 常数时间 it + n / it - n)
+                      │
+                      ▼
+             Contiguous Iterator (连续迭代器，逻辑连续严格对应物理连续内存)
 ```
 
 | 迭代器 Concept | 核心操作要求 | 典型代表容器 |
 | :--- | :--- | :--- |
-| **`std::input_iterator`** | `*it`, `++it` (单遍扫描，不保证多次重入) | `std::istream_iterator` |
-| **`std::forward_iterator`** | `*it`, `++it` (可多次安全保存副本并重复遍历) | `std::forward_list`, `std::unordered_set` |
-| **`std::bidirectional_iterator`** | `--it` (支持逆向遍历) | `std::list`, `std::set`, `std::map` |
-| **`std::random_access_iterator`** | `it + n`, `it[n]`, `it1 - it2`, `<`, `>` | `std::deque` |
+| **`std::input_iterator`** | `*it`, `++it` (单遍扫描，不支持保存副本多次重读) | `std::istream_iterator` |
+| **`std::forward_iterator`** | `*it`, `++it` (多遍扫描，可安全保存迭代器副本) | `std::forward_list`, `std::unordered_set` |
+| **`std::bidirectional_iterator`** | `--it` (支持逆向移动) | `std::list`, `std::set`, `std::map` |
+| **`std::random_access_iterator`** | `it + n`, `it[n]`, `it1 - it2`, `<`, `>` (常数时间跨步) | `std::deque` |
 | **`std::contiguous_iterator`** | 满足物理连续性，`&(*(it + n)) == (&*it) + n` | `std::vector`, `std::array`, `std::string` |
 
-## 2. 迭代器机制与 Traits 萃取
+#### 编译期算法特化分派
 
-### 2.1 `iterator_traits` 五大关联类型
-
-当泛型算法面对任意模板参数 `Iterator` 时，通过 `std::iterator_traits<Iterator>` 萃取其元信息：
+泛型算法在实现中，通过 `if constexpr` 或 `iterator_traits` 标签分派（Tag Dispatching），在编译期自动选择性能最高的最优执行路径：
 
 ```cpp
-template <typename Iterator>
-struct iterator_traits {
-    using difference_type   = typename Iterator::difference_type;   // 两个迭代器相减的距离类型 (如 ptrdiff_t)
-    using value_type        = typename Iterator::value_type;        // 指向元素的原始类型
-    using pointer           = typename Iterator::pointer;           // 指针类型 (如 T*)
-    using reference         = typename Iterator::reference;         // 解引用返回值类型 (如 T&)
-    using iterator_category = typename Iterator::iterator_category; // 迭代器能力标签 Tag
-};
-
-// 针对原生指针 T* 的偏特化 (使裸指针无缝融入 STL 算法体系)
-template <typename T>
-struct iterator_traits<T*> {
-    using difference_type   = std::ptrdiff_t;
-    using value_type        = T;
-    using pointer           = T*;
-    using reference         = T&;
-    using iterator_category = std::random_access_iterator_tag;
-};
+template <typename InputIt, typename Distance>
+constexpr void advance_impl(InputIt& it, Distance n) {
+    if constexpr (std::is_base_of_v<std::random_access_iterator_tag, 
+                                    typename std::iterator_traits<InputIt>::iterator_category>) {
+        // 随机访问迭代器：单周期 O(1) 指针直接加法
+        it += n;
+    } else {
+        // 输入/前向/双向迭代器：退化为 O(N) 循环步进
+        if constexpr (std::is_base_of_v<std::bidirectional_iterator_tag,
+                                        typename std::iterator_traits<InputIt>::iterator_category>) {
+            if (n < 0) {
+                while (n++) --it;
+                return;
+            }
+        }
+        while (n--) ++it;
+    }
+}
 ```
 
-### 2.2 代理引用与 `vector<bool>`
+#### 非同构区间哨兵机制
 
-C++ 标准对 `std::vector<bool>` 进行了空间特化（1 bit 存储 1 个 bool），导致其解引用无法返回真实的 `bool&`（硬件无法对单独的 bit 取物理地址）：
+传统 STL 算法要求区间起始与结束必须是同一种迭代器类型（`[begin, end)` 满足 `same_as<decltype(begin), decltype(end)>`）。
+C++20 Ranges 引入了**哨兵（Sentinel，`std::sentinel_for<S, I>`）机制**，允许结束边界使用与起始迭代器不同的非同构类型（例如以字符 `'\0'` 作为 C 字符串的结束哨兵），使得算法能够以流式模式遍历无限序列或未知长度的数据流，无需提前全量计算区间长度。
+
+---
+
+### 1.3 代理引用机制与布尔向量特化
+
+C++ 标准对 `std::vector<bool>` 进行了空间维度的极限特化（每个布尔值仅占用 1 个 bit，空间压缩比高达 $8:1$）。然而，现代 CPU 硬件架构的最小寻址单元是字节（Byte），无法直接对一个单独的 bit 位取物理内存地址。
+
+因此，`std::vector<bool>` 的 `operator[]` 无法返回原生的 `bool&`，而是返回一个代理引用类 `std::vector<bool>::reference`：
 
 ```cpp
-std::vector<bool> vb = {true, false};
-auto ref = vb[0]; // ref 的实际类型是 std::vector<bool>::reference (代理对象)
+std::vector<bool> vb = {true, false, true};
+
+// 1. 值拷贝推导：正常工作 (隐式转换为 bool)
+auto val = vb[0]; // val 类型为 bool
+
+// 2. 自动类型推导引用：捕获了临时代理对象
+auto ref = vb[0]; // ref 类型为 std::vector<bool>::reference
 
 // ❌ 常见泛型陷阱：
-// auto& bad_ref = vb[0]; // 编译报错：无法将临时代理对象绑定到非常量左值引用 bool&
+// auto& bad_ref = vb[0]; 
+// 编译报错：无法将临时生成的代理对象绑定到非常量左值引用 bool&
 ```
 
 > [!WARNING]
-> 在编写通用模板算法时，不能假定 `*it` 返回的必定是 `value_type&`。现代 C++20 通过 `std::iter_reference_t<It>` 与 `std::indirectly_readable` 概念标准化了代理引用的处理。
+> 在编写高度通用的泛型容器算法时，严禁假定 `*it` 返回的必定是左值引用 `value_type&`。现代 C++20 标准库通过引入 `std::iter_reference_t<It>`、`std::iter_rvalue_reference_t<It>` 与 `std::indirectly_readable` 约束概念，在语言层面完备支持了代理引用的正确交互。
 
-## 3. STL 容器内存布局
+---
 
-### 3.1 `std::vector` 三指针模型
+## 2. 典型 STL 容器物理内存模型与 LLVM 优化
 
-在 64 位主流实现（libstdc++ / libc++）中，`std::vector` 对象本身**严格只占 24 字节**，由 3 个指针构成：
+### 2.1 顺序容器内存排布
+
+#### 连续数组向量物理模型
+
+在 64 位平台主流实现（GCC libstdc++ / Clang libc++）中，`std::vector` 对象本身在栈上**严格只占 24 字节**，由 3 个连续的裸指针构成：
 
 ```text
 std::vector<T> 控制句柄 (栈上 24 字节)
@@ -142,9 +149,9 @@ std::vector<T> 控制句柄 (栈上 24 字节)
            └────────────────── capacity() = end_of_storage - start ──────────┘
 ```
 
-### 3.2 `std::deque` 分段缓冲区
+#### 双端队列中控分段映射模型
 
-`std::deque`（双端队列）避免了 `vector` 单一大块内存扩容的搬迁开销，采用**中控映射表（Map of Buffers）**：
+`std::deque` 采用**中控指针数组（Map of Buffers）**管理多块离散的固定大小连续缓冲区（通常每块缓冲区为 512 字节）。头尾插入与删除具有 $O(1)$ 常数时间复杂度，且**绝不触发已有缓冲区块的物理搬迁**；下标随机访问 `deque[i]` 需要经历两次解引用（先通过中控数组定位所在 Buffer，再计算 Buffer 内相对偏移）：
 
 ```text
 std::deque 控制中枢
@@ -153,129 +160,225 @@ std::deque 控制中枢
 └──────────────────┬───┬───┬─────────────┘
                    │   │   │
                    ▼   ▼   ▼
-Buffer 0:        [   |   |   |   ] (定长固定大小物理页，如 512 字节)
+Buffer 0:        [   |   |   |   ] (固定定长物理页，如 512 字节)
 Buffer 1:        [ Elem 0 | Elem 1 | Elem 2 | Elem 3 ]
 Buffer 2:        [ Elem 4 | Elem 5 |   |   ]
 ```
 
-* **特性**：
-  * 头尾插入和删除具有 $O(1)$ 复杂度，且**绝不触发已有缓冲区块的物理搬迁**；
-  * 下标访问 `deque[i]` 需要两次指针解引用（先查中控表定位 Buffer，再查 Buffer 内偏移），常数开销略大于 `vector`。
+#### 双向链表分散堆节点模型
 
-### 3.3 `std::list` 链表节点
+`std::list` 是典型的环形双向链表结构。每个元素节点在堆上独立分配，除了存储实际数据 `T` 外，必须额外负担 16 字节的指针开销（`prev` + `next`）。虽然节点在内存中离散分布导致 CPU 缓存局部性较差，但在任意已知位置执行插入与删除均为 $O(1)$，且**绝对不会导致其他节点的迭代器与引用失效**。
+
+---
+
+### 2.2 几何级数扩容与 LLVM SmallVector 工业演进
+
+#### 几何级数扩容数学证明
+
+当 `vector::push_back` 触发容量耗尽时，必须申请一块更大的连续内存。若每次仅增加固定常数大小 $C$（算术级数扩容），插入 $N$ 个元素的总拷贝次数为 $O(N^2)$，单次均摊开销退化为 $O(N)$。
+
+若采用**几何级数扩容（Growth Factor $k > 1$）**，单次均摊复杂度可严格证明为 $O(1)$：
+
+$$\text{总数据搬迁成本} = \sum_{i=0}^{\log_k N} k^i = \frac{k^{\log_k N + 1} - 1}{k - 1} = \frac{k N - 1}{k - 1} = O(N)$$
+
+$$\text{单次 push\_back 均摊复杂度} = \frac{O(N)}{N} = O(1)$$
+
+- **$k = 2.0$（GCC libstdc++ / Clang libc++）**：扩容速度快，分配次数少，但在物理内存分配器层面，第 $n$ 次申请的内存大小 $2^n$ 严格大于前 $n-1$ 次释放内存之和（$\sum_{i=0}^{n-1} 2^i = 2^n - 1 < 2^n$），**导致此前释放的内存碎片永远无法在下一次扩容中被就地复用**；
+- **$k = 1.5$（MSVC STL / Facebook Folly）**：扩容曲线更为平缓，当扩容进行数次后，新申请的内存块尺寸小于历史已释放内存块的总和，**允许内存分配器高效复用历史垃圾内存块**，大幅削减虚拟内存碎片。
+
+#### LLVM SmallVector 小对象优化实战
+
+在编译器与图拓扑分析（如 MLIR 算子操作数列表、基本块后继列表）中，绝大多数节点的元素数量非常少（通常 $\le 4$ 个）。若直接使用 `std::vector`，每次创建对象都会触发低效的堆内存 `malloc` 分配。
+
+LLVM 设计了经典的 **`llvm::SmallVector<T, N>`（基于 SBO 的小向量容器）**：
 
 ```text
-std::list 内存布局 (非连续节点分散在堆中)
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│ Node A       │ ──────► │ Node B       │ ──────► │ Node C       │
-│ - prev (8B)  │ ◄────── │ - prev (8B)  │ ◄────── │ - prev (8B)  │
-│ - next (8B)  │         │ - next (8B)  │         │ - next (8B)  │
-│ - Data (T)   │         │ - Data (T)   │         │ - Data (T)   │
-└──────────────┘         └──────────────┘         └──────────────┘
+llvm::SmallVector<T, 4> 内存排布
+┌─────────────────────────────────────────────────────────────┐
+│ SmallVector 栈上句柄结构 (栈连续内存)                          │
+│ ┌──────────────────────┬──────────────────────────────────┐ │
+│ │ T* Begin / Size / Cap│ T InlineStorage[4] (内置 4 个元素)│ │
+│ └──────────┬───────────┴──────────────────────────────────┘ │
+└────────────┼────────────────────────────────────────────────┘
+             │ (元素数量 <= 4 时: 指针直接指向内置栈数组，0 次堆分配！)
+             │
+             ▼ (元素数量 > 4 时: 动态回退分配堆内存，平滑演化为传统 vector)
+堆内存:      [ Elem 0 ][ Elem 1 ][ Elem 2 ][ Elem 3 ][ Elem 4 ]...
 ```
 
-* **开销分析**：每个元素额外负担 16 字节（`prev` + `next`）的指针元数据开销，CPU 缓存局部性（Cache Locality）极差。
+`llvm::SmallVector` 在元素数量未超过阈值 $N$ 时，直接利用对象内部预留的栈空间就地构造对象，**堆内存分配次数为 0**，极大提升了编译器 Pass 执行期间的 CPU 缓存命中率与吞吐效率。
 
-### 3.4 `std::unordered_map` 哈希桶
+---
 
-```text
-Bucket Array (连续指针数组): [ ptr 0 | ptr 1 | ptr 2 | ... ]
-                                │
-                                ▼
-                       Node (Key-Value 节点)
-                       ┌──────────────────────┐
-                       │ - next : Node* (8B)  │ ──► 碰撞链表下一个节点
-                       │ - hash : size_t (8B) │
-                       │ - value: pair<K, V>  │
-                       └──────────────────────┘
-```
+### 2.3 关联容器物理排布与现代平铺优化
 
-* **Rehash 机制**：当元素数量超过 `bucket_count * max_load_factor` 时，触发 Rehash：开辟更大的桶数组，重新计算所有节点的桶下标并重新挂接链表。
+#### 传统节点型容器结构
 
-## 4. 迭代器失效机制
+- **`std::map`**：基于红黑树实现，每个节点包含 3 个指针（`left`, `right`, `parent`）+ 颜色标记 `color` + 键值对数据。节点在堆上离散分配，每次查找需沿指针多级跳转，在现代多级 CPU Cache 架构下会引发大量的 Cache Miss；
+- **`std::unordered_map`**：基于拉链法哈希表实现，由一个连续的 Bucket 指针数组与大量离散的单向链表节点组成。不仅内存开销巨大（每个元素承担指针与哈希缓存），遍历哈希表时也需要不断跳转追逐链表指针。
 
-迭代器失效的本质：**迭代器内部持有的物理内存地址不再对应合法的目标元素**。
+#### 现代平铺哈希架构
 
-### 4.1 连续内存容器失效
+为了解决指针追逐与内存局部性极差的问题，现代高性能库（如 Google Abseil `flat_hash_map`、LLVM `DenseMap`、C++23 `std::flat_map`）全面转向**连续平铺内存与 SIMD 探测架构**：
 
 ```text
-扩容前：[ Obj A ][ Obj B ] (地址 0x1000) ◄── it 指向 0x1000
+Abseil flat_hash_map (Swiss Table) 物理排布
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 连续元数据控制字节数组 (Control Bytes, 1 字节记录哈希低 7 位) │
+│    [ 0x7F | 0x1A | 0x80 (Empty) | 0xFE (Deleted) | 0x3C ... ]│
+└─────────────────────────────────────────────────────────────┘
                                │
-               (触发 push_back 扩容，申请新堆内存 0x5000，旧内存释放 free)
+                               │ 借助 SIMD 指令 (如 _mm_cmpeq_epi8)
+                               │ 单周期并行比对 16 个哈希控制位！
                                ▼
-扩容后：[ Obj A' ][ Obj B' ][ Obj C' ] (新地址 0x5000)
-                                    
-此时原 it 仍指向已被释放的 0x1000 ──► 野指针 (Dangling Pointer)！
+┌─────────────────────────────────────────────────────────────┐
+│ 2. 紧凑连续键值对数据数组 (Slots Array, 密集连续存储)           │
+│    [ (Key0, Val0) | (Key1, Val1) | (Key3, Val3) ... ]       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-* **扩容插入（`size == capacity` 时 `push_back`/`insert`）**：**所有迭代器、指针、引用全部失效**；
-* **非扩容插入（`size < capacity` 时在中间 `insert`）**：插入点之前的迭代器有效，**插入点及其之后的所有迭代器/引用失效**（因元素后移）。
+平铺哈希表将所有数据键值对紧凑存储在单块连续数组中，并利用 SIMD 指令在单 CPU 周期内并行筛选 16 个桶的元数据，在现代高性能编译器与数据库系统中取得了超越传统 `std::unordered_map` 数倍的查找性能。
 
-### 4.2 范围 for 循环修改隐患
+---
+
+## 3. 动态扩容拓扑失效与异常安全
+
+### 3.1 扩容与删除迭代器失效全景
+
+#### 插入操作引发的迭代器失效
+
+当向容器中插入元素时，迭代器失效判定遵循以下严密规则：
+
+| 容器类型 | 插入操作触发的迭代器失效边界 | 内部机理与物理根因 |
+| :--- | :--- | :--- |
+| **`std::vector`** | **触发扩容**：所有迭代器、指针与引用**全量失效**<br>**未触发扩容**：插入点之前的迭代器有效，**插入点及其之后的所有迭代器/引用全部失效** | 扩容导致原内存释放；未扩容时插入点后续元素全部向后物理移动 |
+| **`std::deque`** | **在头尾插入**：所有迭代器失效，但**所有指向元素的指针与引用依然有效**！<br>**在中间插入**：所有迭代器、指针与引用**全部失效** | 头尾插入可能引发中控 Map 扩容重排，但已有 Buffer 物理内存不动 |
+| **`std::list`** | **所有迭代器、指针与引用永久有效** | 仅修改相邻节点的 `prev`/`next` 指针，已有节点内存地址完全不变 |
+| **`std::map / set`** | **所有迭代器、指针与引用永久有效** | 红黑树旋转与变色仅调整指针拓扑，不移动节点物理地址 |
+| **`std::unordered_map`** | **未触发 Rehash**：所有迭代器、指针与引用有效<br>**触发 Rehash**：**所有迭代器全部失效**，但**指针与引用依然有效**！ | Rehash 重新分配桶数组并重构链表，但节点本身内存未被释放 |
+
+#### 删除操作与 Erase-Remove 惯用法
+
+当从容器中删除元素时，被删除元素自身的迭代器必定失效：
+- **`std::vector` 删除**：被删除点之前有效，**被删除点及其之后的所有迭代器/引用全部失效**；
+- **`std::list` / `std::map` 删除**：**仅被删除元素自身的迭代器失效**，其余所有元素的迭代器与引用完全不受影响。
+
+在 C++20 之前，从 `std::vector` 中批量剔除满足条件的元素必须采用经典的 **Erase-Remove 惯用法**：
 
 ```cpp
-// ❌ 极高频的经典未定义行为：
-std::vector<int> vec = {1, 2, 3};
-for (auto x : vec) {
-    if (x == 2) {
-        vec.push_back(100); // 💥 若触发扩容，循环内部隐式缓存的 end 迭代器与遍历指针全部失效！
-    }
-}
+std::vector<int> vec = {1, 2, 3, 4, 5, 6};
+
+// C++11/14/17 经典写法：
+// std::remove_if 将不被删除的元素前移覆盖，返回有效逻辑区间的逻辑尾迭代器
+// vec.erase 执行物理截断，释放尾部无效对象
+vec.erase(std::remove_if(vec.begin(), vec.end(), [](int x) { return x % 2 == 0; }), 
+          vec.end());
+
+// C++20 现代统一全局函数 (消除繁琐样板代码)：
+std::erase_if(vec, [](int x) { return x % 2 == 0; });
 ```
 
-> [!CAUTION]
-> 范围 `for` 循环在进入循环时一次性缓存 `auto __begin = vec.begin(); auto __end = vec.end();`。循环体内对容器结构的修改会导致该遍历逻辑直接崩溃。
+---
 
-### 4.3 哈希容器 rehash 分歧
+### 3.2 哈希 Rehash 迭代器与指针失效分歧
 
-当 `std::unordered_map` 发生 Rehash 时：
-* **迭代器（Iterators）**：**全部失效**（因为桶数组重建，遍历桶的游标完全改变）；
-* **指针与引用（Pointers & References）**：**依然有效**！因为节点实体仍然留在原来的堆地址上，仅仅是改变了桶头指针的链表指向。
-
-## 5. 异常安全与扩容保证
-
-### 5.1 异常安全三大层级
-
-1. **基本异常保证（Basic Guarantee）**：抛出异常后，无内存泄漏，容器仍处于合法但未指定（Valid but Unspecified）的状态。
-2. **强异常安全保证（Strong Guarantee / Commit-or-rollback）**：**操作具备事务性**。若抛出异常，整个容器状态完全回滚到操作调用之前的原样。
-3. **不抛异常保证（Nothrow Guarantee）**：操作绝不抛出任何异常（标记为 `noexcept`）。
-
-### 5.2 `move_if_noexcept` 扩容回滚
-
-为了满足 `vector::push_back` 的**强异常安全保证**，标准库在扩容搬迁元素时必须遵循严格的决策树：
+当哈希容器中元素数量超过 `bucket_count * max_load_factor` 时，容器会申请一个更大的桶数组（通常为原大小的 2 倍），并对所有元素执行 Rehash：
 
 ```text
-                        元素扩容搬迁决策 (std::move_if_noexcept)
-                                           │
-             ┌─────────────────────────────┴─────────────────────────────┐
-             ▼                                                           ▼
-【类型移动构造声明为 noexcept】                                【类型移动构造未标 noexcept 且可拷贝】
-             │                                                           │
-             ▼                                                           ▼
-【采用移动构造搬迁 (Move)】                                    【强制退化为全量深拷贝 (Copy)】
-• 0 次堆内存重新分配                                            • 若中途第 i 个对象拷贝抛异常，旧内存毫发无损
-• 纳秒级指针转移                                                • 直接销毁新内存，容器安全回滚，保证强异常安全！
+              Rehash 过程中的指针与迭代器状态
+              
+【旧桶数组 (即将被释放)】             【新桶数组 (全新分配)】
+[ Bucket 0 ] ──► [ Node A ] ──────┐   [ Bucket 0 ] ──► nullptr
+[ Bucket 1 ] ──► [ Node B ] ──┐   └──► [ Bucket 1 ] ──► [ Node A (地址 0x1000 未变！) ]
+                              └──────► [ Bucket 2 ] ──► [ Node B (地址 0x2000 未变！) ]
+                                      
+1. 迭代器 (遍历游标依赖桶数组结构) ──► 桶数组已被替换重排，所有旧迭代器【全部失效】！
+2. 指针与引用 (直接指向堆上的 Node) ─► Node A (0x1000) 内存物理地址完全未变，【依然有效】！
 ```
 
-#### 标准库底层判定逻辑：
+---
+
+### 3.3 异常安全三级契约与 move_if_noexcept 事务性回滚
+
+#### 异常安全三级保证契约
+
+C++ 针对软件系统提出了三个公认的异常安全层级契约：
+
+1. **基本异常安全保证（Basic Guarantee）**：操作若抛出异常，程序无任何物理内存泄漏，所有对象保持在合法但未指定（Valid but unspecified）的状态；
+2. **强异常安全保证（Strong Guarantee / Commit-or-Rollback）**：操作具备**事务性**。若中途抛出异常，整个容器的状态精确回滚到操作发生前的原始状态，如同操作从未发生过；
+3. **不抛异常保证（Nothrow Guarantee）**：操作保证绝不抛出任何异常，函数签名显式标注 `noexcept`。
+
+#### move_if_noexcept 事务性回滚实现
+
+为了使 `vector::push_back` 在扩容时能够满足强异常安全保证，标准库在数据搬迁阶段通过 `std::move_if_noexcept` 执行编译期静态决策：
+
+```text
+                        扩容数据搬迁决策 (std::move_if_noexcept)
+                                            │
+              ┌─────────────────────────────┴─────────────────────────────┐
+              ▼                                                           ▼
+【元素移动构造函数标有 noexcept】                               【元素移动构造未标 noexcept 且支持拷贝】
+              │                                                           │
+              ▼                                                           ▼
+【采用移动语义搬迁 (std::move)】                                【强制退化为深拷贝搬迁 (Copy)】
+• 零堆内存开销，纳秒级指针掠夺                                  • 若在搬迁第 i 个对象时抛出异常，旧内存数据完好
+• 性能极高                                                      • 直接销毁新内存，容器恢复原状，达成强异常安全！
+```
+
 ```cpp
-template <typename T>
-using move_if_noexcept_t = std::conditional_t<
-    !std::is_nothrow_move_constructible_v<T> && std::is_copy_constructible_v<T>,
-    const T&, // 强制走拷贝构造
-    T&&       // 走移动构造
->;
+class TensorBuffer {
+public:
+    // ✔️ 黄金法则：移动构造函数必须无条件标记 noexcept！
+    TensorBuffer(TensorBuffer&& other) noexcept 
+        : data_(other.data_), size_(other.size_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+private:
+    float* data_;
+    size_t size_;
+};
 ```
 
-> [!IMPORTANT]
-> **工业级性能准则**：自定义类型若定义了移动构造函数，**必须显式添加 `noexcept` 修饰符**，否则在存入 `std::vector` 等容器后，扩容操作会完全丧失移动语义带来的性能优势。
+---
 
-## 6. 容器特性与失效速查表
+## 4. 容器全景特性对比与工业选型矩阵
 
-| 容器 | 迭代器能力 | 物理存储模型 | 随机访问复杂度 | 典型插入/删除复杂度 | 结构调整失效规则 |
-| :--- | :--- | :--- | :---: | :---: | :--- |
-| **`std::vector`** | Contiguous | 单块连续堆内存 | $O(1)$ | 尾部均摊 $O(1)$，中间 $O(N)$ | 扩容则全失效；未扩容则插入点之后失效 |
-| **`std::deque`** | Random Access | 分段中控缓冲区 | $O(1)$ | 头尾 $O(1)$，中间 $O(N)$ | 头尾插入迭代器失效但指针有效；中间修改全失效 |
-| **`std::list`** | Bidirectional | 独立双向堆节点 | ❌ 仅线性遍历 | 已知位置 $O(1)$ | 仅被删除节点失效，其他节点迭代器/指针永不失效 |
-| **`std::set` / `map`** | Bidirectional | 红黑树平衡节点 | ❌ $O(\log N)$ | 增删查 $O(\log N)$ | 插入永不失效；删除仅被删节点失效 |
-| **`std::unordered_map`** | Forward | 哈希桶 + 链表节点 | ❌ 平均 $O(1)$ | 平均 $O(1)$，最坏 $O(N)$ | Rehash 导致迭代器全失效，但节点引用/指针保持有效 |
+### 4.1 六大常用 STL 容器物理与算法特性全景
+
+| 容器类型 | 底层物理数据结构 | 随机访问性能 | 头部插入 | 尾部插入 | 中间插入 | 内存额外开销 (Per-element Overhead) | CPU 缓存局部性 (Cache Locality) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |
+| **`std::vector`** | 动态连续物理数组 | $O(1)$ | $O(N)$ | 均摊 $O(1)$ | $O(N)$ | **极低**（仅预留 capacity 空间） | **极佳**（物理内存连续，支持硬件预取） |
+| **`std::deque`** | 中控映射分段连续缓冲区 | $O(1)$ | $O(1)$ | $O(1)$ | $O(N)$ | **低**（中控 map 指针数组） | **良好**（分页内部连续） |
+| **`std::list`** | 双向非连续链表 | $O(N)$ | $O(1)$ | $O(1)$ | $O(1)$ | **高**（每个节点固定 16 字节指针） | **极差**（堆节点离散跳跃寻址） |
+| **`std::set / map`** | 红黑树（平衡二叉搜索树） | $O(\log N)$ 查找 | — | — | $O(\log N)$ | **高**（每个节点 24~32 字节指针与对齐） | **较差**（树节点离散分布） |
+| **`std::unordered_map`** | 开链哈希表（桶数组 + 单链表） | 均摊 $O(1)$ 查找 | — | — | 均摊 $O(1)$ | **极高**（桶数组 + 节点指针 + 哈希缓存） | **极差**（哈希离散跳跃） |
+| **`std::string`** | 连续字符数组 + SBO 优化 | $O(1)$ | $O(N)$ | 均摊 $O(1)$ | $O(N)$ | **短字符串 0 堆开销**（栈上 15 字节 SBO） | **极佳** |
+
+---
+
+### 4.2 编译器与高性能系统场景选型决策树
+
+```text
+                                 现代 C++ 容器工业选型决策树
+                                             │
+         ┌───────────────────────────────────┴───────────────────────────────────┐
+         ▼                                                                       ▼
+【需要键值对映射 / 集合去重检索】                                         【纯线性序列存储与遍历】
+         │                                                                       │
+     ┌───┴───────────────────┐                                       ┌───────────┴───────────┐
+     ▼                       ▼                                       ▼                       ▼
+[要求元素严格有序]     [追求极限吞吐与平均查找]                     [大小编译期固定]        [大小运行期动态变化]
+     │                       │                                       │                       │
+     ▼                       ▼                                       ▼                       ▼
+【std::map】           [元素数量较少或高频小表]                    【std::array】          [元素数量极少，如 <= 8]
+ (红黑树结构)                 │                                                               │
+                     ┌───────┴───────┐                                               ┌───────┴───────┐
+                     ▼               ▼                                               ▼               ▼
+               【LLVM DenseMap】 【std::unordered_map】                         【llvm::SmallVector】【频繁头尾双端操作】
+               (或 flat_hash_map)  (通用工业级兜底)                              (栈就地分配零堆开销)         │
+                                                                                             ┌───────┴───────┐
+                                                                                             ▼               ▼
+                                                                                       【std::deque】  【默认首选 std::vector】
+                                                                                       (任务队列/缓冲区) (95% 业务场景的最优解！)
+```

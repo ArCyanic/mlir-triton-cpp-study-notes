@@ -1,159 +1,218 @@
 # CRTP 模式与 PassWrapper 基础设施
 
-> 本文系统剖析现代编译器中用于消除重复样板代码的核心设计模式——**CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）**。以 Triton 内部 Verifier Pass 以及 TableGen 自动生成的 Pass 基类为用例，深入 C++ 不完整类型（Incomplete Type）编译期延迟实例化时序；系统拆解 `PassWrapper<PassT, BaseT>` 如何利用静态向下转型（`static_cast`）实现 `TypeID` 注入、动态深拷贝克隆（`clonePass`）与调度根约束。
+> 本文系统解构现代编译器中用于消除重复样板代码的核心设计模式——**CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）**。以 MLIR 核心框架与 Triton 编译器内部的 Verifier/Pass 基础设施为实战场景，深入剖析 C++ 不完整类型（Incomplete Type）在类模板中的四阶段延迟实例化时序；系统拆解 `PassWrapper<PassT, BaseT>` 基于静态向下转型（`static_cast`）实现的 `TypeID` 注入、隐藏友元运算符、编译期静态纯虚契约检查；详述 MLIR 多线程并发调度下的 `clonePass()` 线程局部隔离拓扑；最后推导 TableGen 声明式代码生成与全局 CLI 管道反射注册的工程闭环。
 
-## 目录
+---
 
-- [1. CRTP 模式与静态分派](#1-crtp-模式与静态分派)
-  - [1.1 派生类类型捕获](#11-派生类类型捕获)
-  - [1.2 虚函数分派 vs CRTP 静态分派](#12-虚函数分派-vs-crtp-静态分派)
-- [2. 不完整类型与延迟实例化](#2-不完整类型与延迟实例化)
-  - [2.1 编译期四阶段时序](#21-编译期四阶段时序)
-  - [2.2 CRTP 内存布局安全边界](#22-crtp-内存布局安全边界)
-- [3. PassWrapper 基础设施实现](#3-passwrapper-基础设施实现)
-  - [3.1 PassT 四重信息流向](#31-passt-四重信息流向)
-  - [3.2 clonePass 与 static_cast](#32-clonepass-与-static_cast)
-  - [3.3 BaseT 调度根约束](#33-baset-调度根约束)
-- [4. TableGen 生成基类与 CRTP](#4-tablegen-生成基类与-crtp)
-  - [4.1 PassWrapper vs TableGen 生成基类](#41-passwrapper-vs-tablegen-生成基类)
-  - [4.2 声明式选项与派生实现](#42-声明式选项与派生实现)
+## 1. CRTP 模式与静态多态分派体系
 
-## 1. CRTP 模式与静态分派
+### 1.1 派生类类型反向捕获机理
 
-### 1.1 派生类类型捕获
-
-在 MLIR 与 Triton 框架中，我们经常看到形如 `class Derived : public Base<Derived>` 的继承定义：
+在 MLIR 与 Triton 框架中，算子句柄、分析工具与编译器 Pass 广泛采用形如 `class Derived : public Base<Derived>` 的继承定义：
 
 ```cpp
-// 1. MLIR 算子句柄中的 CRTP
+// 1. MLIR 算子句柄中的 CRTP 静态混入
 class LoadOp : public Op<LoadOp, OpTrait::MemRead> {};
 
-// 2. MLIR Pass 基础设施中的 CRTP
+// 2. MLIR Pass 基础设施中的 CRTP 包装器
 struct VerifyWarpSpecializationPartitions
     : PassWrapper<VerifyWarpSpecializationPartitions, OperationPass<ModuleOp>> {
-  void runOnOperation() override;
+    void runOnOperation() override;
 };
 ```
 
-#### 通用基类缺少派生类的具体身份
+在面向对象架构中，通用基类（如 `PassWrapper` 或 `Op`）需要提供通用算法骨架（如对象克隆、全局唯一类型标识提取、类型名称反射等），但这些操作的具体执行**在语义上强依赖于最终派生类的具体 C++ 类型**：
 
-在面向对象设计中，通用基类（如 `PassWrapper` 或 `Op`）需要提供通用算法实现（如对象克隆、名称查询、RTTI 替代判别等），但这些算法的具体执行**强依赖于最终派生类的具体 C++ 类型**：
-- `clonePass()` 必须调用具体派生类的拷贝构造函数 `new PassT(*this)`；
-- `getTypeID()` 必须获取派生类的唯一身份 `TypeID::get<PassT>()`；
-- `getName()` 必须反射出派生类的类型名称 `llvm::getTypeName<PassT>()`。
+- **对象深拷贝（`clonePass`）**：必须调用具体派生类的拷贝构造函数 `new PassT(*this)`；
+- **类型标识生成（`getTypeID`）**：必须获取派生类的唯一地址 `TypeID::get<PassT>()`；
+- **类名字符串反射（`getName`）**：必须获取派生类的去修饰 C++ 名称 `llvm::getTypeName<PassT>()`。
 
-传统面向对象范式只能通过声明大量的 `virtual` 虚函数来强迫派生类编写样板代码；而 CRTP 模式通过**将派生类自身作为模板实参传给基类**，让基类在编译期直接捕获派生类的具体类型信息，实现通用样板的自动化静态生成。
+传统面向对象范式只能通过在基类中声明大量 `virtual` 虚函数，强迫开发者在每个具体派生类中手动重写样板代码；而 CRTP 模式通过**将派生类自身作为模板实参传递给基类**，使基类在编译期直接捕获了派生类的完整类型信息，实现了通用样板的编译期全自动静态代码生成。
 
-### 1.2 虚函数分派 vs CRTP 静态分派
+---
 
-```
-           虚函数动态多态 vs CRTP 编译期静态分派模型
+### 1.2 虚函数动态多态与 CRTP 静态多态对比
+
+```text
+            虚函数动态多态 vs CRTP 编译期静态多态模型
 【1. 经典虚函数 (Dynamic Polymorphism)】
-基类指针 p ──► 读取 vptr ──► 查虚函数表 ──► 执行 Thunk ──► 跳转至具体实现 (无法内联，有间接调用开销)
+基类指针 p ──► 读取 vptr ──► 查虚函数表 (vtable) ──► 间接跳转执行 (无法内联，存在内存与周期开销)
 
 【2. CRTP 静态多态 (Compile-Time Polymorphism)】
-Base<Derived> ──► 编译期 static_cast<Derived*>(this) ──► 直接调用 Derived 成员函数 (完全内联)
+Base<Derived> ──► static_cast<Derived*>(this) ──► 编译期直接调用 Derived 成员 (100% 深度内联展开)
 ```
 
-| 维度 | 经典虚函数（Virtual Function） | CRTP 静态多态（CRTP Pattern） |
+| 架构对比维度 | 经典虚函数体系（Virtual Functions） | CRTP 静态多态体系（CRTP Pattern） |
 | :--- | :--- | :--- |
-| **类型绑定时机** | 运行时（Runtime 查虚表） | **编译期（Compile-Time 模板实例化）** |
-| **内存开销** | 8 字节 `vptr` + 虚表数据段 | **0 字节额外内存开销** |
-| **执行开销** | 间接寻址 + 间接跳转（破坏内联） | **直接内联展开（无额外跳转开销）** |
-| **适用场景** | 异构对象必须放入同构容器统一管理 | 抽取通用算法样板、Trait 静态混入 |
+| **类型绑定时机** | **运行期（Runtime）**：通过虚函数表指针动态决议 | **编译期（Compile-Time）**：通过模板实例化静态下转 |
+| **内存空间开销** | 每个对象额外承担 8 字节 `vptr` + 全局只读虚表段 | **严格为 0 字节**（无任何额外内存开销） |
+| **执行性能与内联** | 间接寻址 + 间接跳转（破坏 CPU 分支预测，阻碍内联） | **直接内联展开（Inlining）**，与手写原生函数性能完全一致 |
+| **容器同构性需求** | 支持将不同派生类对象放入 `std::vector<Base*>` 统一管理 | 派生类属于完全独立的 C++ 类型，无法直接放入非泛型同构容器 |
+| **编译器适用场景** | 跨模块动态插件扩展、顶层 PassManager 统一调度链 | **算子句柄（OpView）、Trait 静态混入、PassWrapper 样板生成** |
 
-## 2. 不完整类型与延迟实例化
+---
 
-### 2.1 编译期四阶段时序
+### 1.3 隐藏友元机制与基类非虚析构防泄漏
 
-初学 CRTP 时，常见的疑问是：
-> “当编译器读到 `struct VerifyPartitions : PassWrapper<VerifyPartitions>` 时，`VerifyPartitions` 还没定义完，为什么能当作模板参数传给基类？”
+#### 隐藏友元运算符注入
 
-C++ 标准规定：**类在声明其基类列表时，自身处于不完整类型（Incomplete Type）状态**。类模板在处理不完整类型时，遵循严格的**两阶段名称查找与延迟实例化规则**：
+在设计编译器轻量句柄（如 `OpView` / `Value`）时，通常需要支持对称的比较运算符（如 `==` 与 `!=`）。利用 CRTP 结合 **隐藏友元（Hidden Friends / Barton-Nackman 技巧）**，可以在基类内部自动为派生类生成对称的比较函数，同时将实参依赖查找（ADL, Argument-Dependent Lookup）严格限制在当前类作用域内，避免全局命名空间污染与不必要的隐式类型转换：
 
+```cpp
+template <typename Derived>
+class EqualityComparable {
+public:
+    // 隐藏友元：在基类内部直接内联定义友元函数
+    friend bool operator==(const Derived &lhs, const Derived &rhs) {
+        return lhs.isEqual(rhs); // 静态调用派生类的具体比对方法
+    }
+
+    friend bool operator!=(const Derived &lhs, const Derived &rhs) {
+        return !lhs.isEqual(rhs);
+    }
+};
+
+// 派生类继承即可获得全套对称比较操作符：
+class IntAttr : public EqualityComparable<IntAttr> {
+    int value_;
+public:
+    explicit IntAttr(int v) : value_(v) {}
+    bool isEqual(const IntAttr &other) const { return value_ == other.value_; }
+};
 ```
-                    CRTP 编译期四阶段时序拓扑
- 阶段 1: 符号声明 (Symbol Declaration)
-   编译器解析到 `struct VerifyPartitions` ──► 符号表中注册类型名 (此时为 Incomplete Type)
+
+#### 基类受保护析构函数法则
+
+在 CRTP 体系中，基类通常**不包含虚析构函数**以避免引入 `vptr` 开销。若外部代码误将派生类对象赋给基类指针并执行 `delete base_ptr`，将导致派生类的析构函数无法执行，引发未定义行为（Undefined Behavior）与内存泄漏。
+
+> [!IMPORTANT]
+> **CRTP 防泄漏黄金法则**：CRTP 基类的析构函数必须声明为 **`protected` 且非虚（Non-virtual Protected Destructor）**。这样既能允许派生类在自身析构时正常调用基类析构，又能强行在编译期拦截任何通过基类裸指针执行 `delete` 的非法操作。
+
+---
+
+## 2. 不完整类型约束与延迟实例化时序
+
+### 2.1 编译期四阶段生命周期时序拓扑
+
+C++ 标准严格规定：**当一个类正在声明其基类列表时，该类自身处于不完整类型（Incomplete Type）状态**。例如在解析 `struct VerifyPartitions : PassWrapper<VerifyPartitions, ...>` 时，编译器在处理 `PassWrapper<...>` 时尚未读取 `VerifyPartitions` 的类主体花括号。
+
+CRTP 能够成功编译的核心在于 C++ 类模板的**两阶段名字查找与成员函数延迟实例化机制（Delayed Instantiation）**：
+
+```text
+                     CRTP 编译期四阶段时序拓扑
+ 阶段 1: 符号前向声明 (Symbol Forward Declaration)
+   编译器读取到 `struct VerifyPartitions` ──► 在符号表中注册该类型名 (此时为 Incomplete Type)
           │
           ▼
- 阶段 2: 基类实例化 (Base Class Instantiation)
-   编译器处理基类列表 `PassWrapper<VerifyPartitions>`:
-   - 确定基类内存大小与成员变量排布 (此时 PassWrapper 内部仅需知道 VerifyPartitions 是一个类型名)
+ 阶段 2: 基类模板实例化 (Base Class Template Instantiation)
+   编译器处理基类列表 `PassWrapper<VerifyPartitions, ...>`:
+   - 确定基类的成员变量与物理内存排布 (此时 PassWrapper 内部仅需知道 VerifyPartitions 是一个合法类型名)
+   - 绝不计算 `sizeof(VerifyPartitions)`，也不展开基类的成员函数代码体！
           │
           ▼
- 阶段 3: 派生类定义完成 (Class Definition Complete)
-   编译器解析 `VerifyPartitions` 的花括号 `{ ... }` 内部字段与函数:
-   - `VerifyPartitions` 变为完整类型 (Complete Type)
+ 阶段 3: 派生类主体解析完成 (Derived Class Definition Complete)
+   编译器解析 `VerifyPartitions` 的 `{ ... }` 内部字段与函数:
+   - `VerifyPartitions` 正式转化为完整类型 (Complete Type)
           │
           ▼
- 阶段 4: 成员函数体延迟实例化 (Delayed Member Function Instantiation)
-   当代码实际调用 `clonePass()` 或 `getName()` 时:
-   - 编译器实例化基类模板的函数体
-   - 此时 `VerifyPartitions` 已经完整定义，`sizeof(PassT)` 与构造函数均完全可用！
+ 阶段 4: 基类成员函数延迟实例化 (Delayed Member Function Instantiation)
+   当代码在外部实际调用 `pass.clonePass()` 或 `pass.getName()` 时:
+   - 编译器才真正展开并编译基类内部的成员函数代码体
+   - 此时 `VerifyPartitions` 已经完整定义，`sizeof(PassT)` 与拷贝构造函数均完全就绪！
 ```
 
-### 2.2 CRTP 内存布局安全边界
+---
 
-理解延迟实例化时序，有助于明确 CRTP 基类中哪些操作是合法的：
+### 2.2 CRTP 内存排布合法性与物理安全边界
+
+理解四阶段延迟实例化时序，能够严密界定 CRTP 基类中哪些操作是合法的：
 
 ```cpp
 template <typename DerivedT>
-class SafeBase {
-  // ✅ 合法：指针与引用不需要完整类型
-  DerivedT *ptr;
+class CrtpBase {
+    // ✅ 允许：定义指向不完整类型的指针或引用 (阶段 2 仅需 8 字节指针大小)
+    DerivedT *cachedDerivedPtr_;
 
-  // ✅ 合法：函数声明不需要完整类型
-  void process(const DerivedT &obj);
+    // ✅ 允许：声明接受或返回不完整类型的函数原型
+    void process(const DerivedT &obj);
 
-  // ✅ 合法：函数体延迟到阶段 4 实例化，届时 DerivedT 已经完整
-  void doClone() {
-    DerivedT copy = *static_cast<DerivedT *>(this); // 合法！
-  }
+    // ✅ 允许：在成员函数体内部使用 DerivedT 的方法与成员 (延迟到阶段 4 编译)
+    void execute() {
+        auto *derived = static_cast<DerivedT *>(this);
+        derived->run(); // 合法！在阶段 4 展开时 DerivedT 已拥有 run() 定义
+    }
 
-  // ❌ 编译错误：在阶段 2 计算基类大小时，DerivedT 尚未完成定义！
-  // DerivedT invalidMember; // 错误：field has incomplete type 'DerivedT'
+    // ❌ 严禁：在基类内部直接声明不完整类型的普通成员变量！
+    // DerivedT invalidMember_; // 编译报错：field has incomplete type 'DerivedT'
 };
 ```
 
-## 3. PassWrapper 基础设施实现
+---
 
-### 3.1 PassT 四重信息流向
+### 2.3 静态纯虚契约与编译期强制重写校验
 
-MLIR 的 `PassWrapper<PassT, BaseT>` 模板骨架通过一个 `PassT` 模板参数，自动生成了 Pass 运行所需的 4 大关键机制：
+传统虚函数体系使用 `= 0` 声明纯虚接口，强迫派生类必须重写；而在 CRTP 静态多态中，若派生类遗漏了关键方法的实现，默认情况下编译器可能会静默回退到基类的缺省实现或产生晦涩的链接错误。
+
+在现代编译器开发中，可以通过在 CRTP 基类中注入 **`static_assert` 静态断言**，在编译期强制校验派生类是否重写了特定接口：
+
+```cpp
+template <typename Derived>
+class PassContract {
+public:
+    void executePass() {
+        // 编译期静态校验：确保派生类必须显式提供 runOnOperation 成员函数
+        static_assert(&Derived::runOnOperation != &PassContract::runOnOperationFallback,
+                      "CRTP Violation: Derived Pass MUST implement 'runOnOperation()'!");
+        
+        static_cast<Derived *>(this)->runOnOperation();
+    }
+
+private:
+    void runOnOperationFallback() {}
+};
+```
+
+若派生类未能重写 `runOnOperation`，编译器在阶段 4 实例化时会直接抛出精准、高可读性的静态断言报错，使 CRTP 静态多态兼具与纯虚函数完全等效的接口约束力。
+
+---
+
+## 3. PassWrapper 基础设施与多线程隔离架构
+
+### 3.1 PassT 四重元数据与流向闭环
+
+MLIR 的 `PassWrapper<PassT, BaseT>` 模板骨架通过引入唯一的 `PassT` 模板形参，在基类中全自动闭环生成了 Pass 运行所需的 4 大核心机制：
 
 ```cpp
 namespace mlir {
 template <typename PassT, typename BaseT>
 class PassWrapper : public BaseT {
 public:
-  // 1. 静态 classof 谓词：将 TypeID 比较绑定到 PassT
-  static bool classof(const Pass *pass) {
-    return pass->getTypeID() == TypeID::get<PassT>();
-  }
+    // 1. 静态 classof 谓词：用于 LLVM RTTI 体系中的 llvm::dyn_cast<PassT>
+    static bool classof(const Pass *pass) {
+        return pass->getTypeID() == TypeID::get<PassT>();
+    }
 
-  ~PassWrapper() override = default;
+    ~PassWrapper() override = default;
 
 protected:
-  // 2. 构造函数：自动将 PassT 的 TypeID 注入基类 Pass
-  PassWrapper() : BaseT(TypeID::get<PassT>()) {}
+    // 2. 构造函数：自动将 PassT 的全局唯一 TypeID 静态注入底层 BaseT
+    PassWrapper() : BaseT(TypeID::get<PassT>()) {}
 
-  // 3. 名称反射：自动从 PassT 获取去修饰的 C++ 类型名
-  StringRef getName() const override {
-    return llvm::getTypeName<PassT>();
-  }
+    // 3. 名称反射：自动从 PassT 类型中提取人类可读的 C++ 类型名
+    StringRef getName() const override {
+        return llvm::getTypeName<PassT>();
+    }
 
-  // 4. 动态克隆：通过 static_cast 派生下转实现完整对象深拷贝
-  std::unique_ptr<Pass> clonePass() const override {
-    return std::make_unique<PassT>(
-        *static_cast<const PassT *>(this));
-  }
+    // 4. 动态克隆：通过 static_cast 派生下转实现对象的精准深拷贝
+    std::unique_ptr<Pass> clonePass() const override {
+        return std::make_unique<PassT>(*static_cast<const PassT *>(this));
+    }
 };
 }
 ```
 
-```
-                        PassT 在 PassWrapper 中的四重流向
+```text
+                        PassT 在 PassWrapper 中的四重元数据流向
                          template <typename PassT>
                                      │
        ┌────────────────┬───────────┴───────────┬────────────────┐
@@ -164,104 +223,138 @@ BaseT(TypeID::   getName() { return      classof(pass) {   clonePass() {
                                            get<PassT>();}      *static_cast<PassT*>(this));}
 ```
 
-### 3.2 clonePass 与 static_cast
+---
 
-在 `clonePass()` 中，核心转换语句是：
+### 3.2 static_cast 零开销派生下转与汇编透传
 
-```cpp
-const auto *concretePass = static_cast<const PassT *>(this);
-return std::make_unique<PassT>(*concretePass);
+在 `clonePass()` 的实现中，核心代码是 `*static_cast<const PassT *>(this)`。该转换在 C++ 底层具有极高的执行效率与完备的安全性：
+
+- **单继承偏移归零（$\Delta = 0$）**：在典型的单继承物理模型下，`PassWrapper` 基类子对象的起始地址与外部 `PassT` 派生类完整对象的内存起始地址完全重合。因此在 x86-64 汇编指令层面，`static_cast` **不产生任何加减法寻址指令，直接在寄存器中透传 `this` 指针**；
+- **类型安全保障**：由于 `PassWrapper` 是通过 CRTP 专门为 `PassT` 实例化的基类，其运行时的 `this` 指针所指向的实体在类型系统层面 100% 确定是 `PassT`，因而**彻底免除了昂贵的 `dynamic_cast` 运行时虚表遍历与 RTTI 检查**。
+
+---
+
+### 3.3 多线程并行 Pass 调度与线程局部隔离
+
+在现代高性能编译器（如 MLIR / LLVM / Triton）中，PassManager 在处理包含数千个函数的 Module 时，会启动多线程工作池（Worker Thread Pool）并发执行变换 Pass。
+
+```text
+                  MLIR 多线程并发 Pass 调度与 clonePass 隔离架构
+                               PassManager 调度中心
+                                        │
+             ┌──────────────────────────┼──────────────────────────┐
+             ▼                          ▼                          ▼
+     [Worker Thread 0]          [Worker Thread 1]          [Worker Thread 2]
+             │                          │                          │
+             │ 调用 clonePass()         │ 调用 clonePass()         │ 调用 clonePass()
+             ▼                          ▼                          ▼
+   ┌───────────────────┐      ┌───────────────────┐      ┌───────────────────┐
+   │ Pass 实例 A (副本) │      │ Pass 实例 B (副本) │      │ Pass 实例 C (副本) │
+   │ 独立成员与分析状态 │      │ 独立成员与分析状态 │      │ 独立成员与分析状态 │
+   └─────────┬─────────┘      └─────────┬─────────┘      └─────────┬─────────┘
+             │                          │                          │
+             ▼                          ▼                          ▼
+       func @kernel_0             func @kernel_1             func @kernel_2
 ```
 
-#### 为什么这里使用 `static_cast` 安全且高效？
+Pass 类往往包含内部成员变量（如统计计数器、临时分析缓存、DominanceTree 句柄）。如果多个线程共享同一个 Pass 单例实例，并发读写成员变量将直接引发毁灭性的**数据竞争（Data Race）**。
 
-1. **编译期继承约束**：`PassWrapper<PassT, BaseT>` 是 `PassT` 的公有直接基类，编译器在编译期已掌握完整的继承偏移动态；
-2. **0 周期指针转换**：在单继承体系下，基类子对象与派生类完整对象的起始地址严格重合（偏移量 $\Delta = 0$）。因此 `static_cast` 在汇编层面不产生任何加减法指令，直接透传 `this` 指针；
-3. **消除动态检查**：不需要调用开销较大的 `dynamic_cast`，因为 CRTP 的实例化语义保证了当前运行的 `this` 对象必定是一个合法的 `PassT` 实例。
+`PassManager` 在将 Pass 分发给各个工作线程前，必须强制调用虚接口 `clonePass()` 为每个线程克隆出一个独立的 Pass 副本。`PassWrapper` 借助 CRTP 自动生成了强类型的深拷贝逻辑，从而在多线程并发架构下提供了坚如磐石的**线程局部状态隔离（Thread-Local Isolation）**。
 
-### 3.3 BaseT 调度根约束
+---
 
-`PassWrapper` 的第二个模板参数 `BaseT` 承担了 **Pass 调度根约束**：
+### 3.4 BaseT 调度根约束与类型安全校验
+
+`PassWrapper` 的第二个模板参数 `BaseT` 承担了 **Pass 调度根约束** 的职责：
 
 ```cpp
-// 该 Pass 只能挂载并运行在 ModuleOp 级别上
-struct MyModulePass : PassWrapper<MyModulePass, OperationPass<ModuleOp>> {
-  void runOnOperation() override {
-    ModuleOp module = getOperation(); // 类型安全：直接返回 ModuleOp 句柄
-  }
+// 该 Pass 只能挂载并调度在 ModuleOp 级别上
+struct TritonModulePass : PassWrapper<TritonModulePass, OperationPass<ModuleOp>> {
+    void runOnOperation() override {
+        ModuleOp module = getOperation(); // 类型安全：直接返回 ModuleOp 句柄
+    }
 };
 
-// 该 Pass 挂载并运行在具体 Function 级别上
-struct MyFuncPass : PassWrapper<MyFuncPass, OperationPass<func::FuncOp>> {
-  void runOnOperation() override {
-    func::FuncOp func = getOperation(); // 直接返回 func::FuncOp 句柄
-  }
+// 该 Pass 只能挂载并调度在具体 Function 级别上
+struct TritonFunctionPass : PassWrapper<TritonFunctionPass, OperationPass<func::FuncOp>> {
+    void runOnOperation() override {
+        func::FuncOp func = getOperation(); // 直接返回 func::FuncOp 句柄
+    }
 };
 ```
 
-- `OperationPass<OpT>` 在其构造函数中将 `OpT::getOperationName()` 传递给 MLIR Pass 调度管理器，使 PassManager 能够在构建流水线时直接静态校验 Pass 是否被挂载到了合法的 IR 节点上。
+`OperationPass<OpT>` 在其构造函数中将目标算子的名称 `OpT::getOperationName()` 传递给底层调度器。当开发者试图将一个 `OperationPass<func::FuncOp>` 错误地挂载到 Module 流水线上时，PassManager 会在流水线构建阶段直接拦截并报告静态约束错误。
 
-## 4. TableGen 生成基类与 CRTP
+---
 
-### 4.1 PassWrapper vs TableGen 生成基类
+## 4. TableGen 声明式生成基类与工程闭环
 
-在大型生产级项目（如 Triton）中，公开的 Pass 通常包含繁多的命令行参数（Options）和统计量（Statistics）。MLIR 采用 **TableGen 声明式元编程 + CRTP** 的组合架构：
+### 4.1 TableGen 声明式代码生成与 CRTP 协同
 
-```
-                    TableGen 与 CRTP 结合的代码生成流向
-Passes.td (声明 Options/Dialects) ──► mlir-tblgen ──► 生成 TritonGPU...Base<DerivedT> (CRTP 基类)
-                                                                 ▲
-                                                                 │ 继承并注入自身
-                                                      struct AutomaticWarpSpecialization
+在大型生产级编译器工程（如 Triton / MLIR Dialect）中，公开的 Pass 通常包含复杂的命令行参数（CLI Options）与运行时统计指标（Statistics）。MLIR 采用了 **TableGen 声明式定义 + CRTP 骨架生成** 的协同架构：
+
+```text
+                     TableGen 声明式 Pass 生成闭环
+Passes.td 声明式配置 ──► mlir-tblgen ──► 生成 TritonGPU...Base<DerivedT> (CRTP 基类)
+ (定义 CLI Options 等)                           ▲
+                                                 │ 继承并注入具体实现类型
+                                     struct AutomaticWarpSpecialization
 ```
 
 ```cpp
-// TableGen 生成的 Pass 基类骨架 (完全遵循 CRTP 模式)
+// TableGen 自动生成的 Pass 基类骨架 (完全遵循 CRTP 设计范式)
 template <typename DerivedT>
 class TritonGPUAutomaticWarpSpecializationBase : public OperationPass<ModuleOp> {
 public:
-  using Base = TritonGPUAutomaticWarpSpecializationBase;
+    using Base = TritonGPUAutomaticWarpSpecializationBase;
 
-  TritonGPUAutomaticWarpSpecializationBase()
-      : OperationPass<ModuleOp>(TypeID::get<DerivedT>()) {}
+    TritonGPUAutomaticWarpSpecializationBase()
+        : OperationPass<ModuleOp>(TypeID::get<DerivedT>()) {}
 
-  // 自动注入 CRTP clonePass
-  std::unique_ptr<Pass> clonePass() const override {
-    return std::make_unique<DerivedT>(*static_cast<const DerivedT *>(this));
-  }
+    // 自动生成的 CRTP 深拷贝方法
+    std::unique_ptr<Pass> clonePass() const override {
+        return std::make_unique<DerivedT>(*static_cast<const DerivedT *>(this));
+    }
 
-  // 自动生成 Options 成员与解析接口
-  Pass::Option<int32_t> numStages{*this, "num-stages", llvm::cl::desc("Pipeline stages"), llvm::cl::init(3)};
+    // 自动生成的强类型 CLI Option 成员
+    Pass::Option<int32_t> numStages{
+        *this, "num-stages", 
+        llvm::cl::desc("Number of pipeline stages"), 
+        llvm::cl::init(3)
+    };
 };
 ```
 
-### 4.2 声明式选项与派生实现
+---
 
-在开发者编写的具体 Pass 实现中，代码极其精简，只需关注算法本身：
+### 4.2 全局 Pass 注册中心与 CLI 管道反射解析
+
+在 TableGen 生成的代码末尾，会自动生成全局注册函数：
 
 ```cpp
-// 开发者编写的具体 Pass
-struct AutomaticWarpSpecialization
-    : public triton::gpu::impl::TritonGPUAutomaticWarpSpecializationBase<
-          AutomaticWarpSpecialization> {
-  // 继承 TableGen 基类的构造函数
-  using Base::Base;
-
-  void runOnOperation() override {
-    // 直接读取 TableGen 自动绑定的 options
-    int stages = numStages.getValue();
-    // 执行算法 ...
-  }
-};
+// TableGen 自动生成的全局 Pass 注册函数
+inline void registerTritonGPUAutomaticWarpSpecializationPass() {
+    ::mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+        return std::make_unique<AutomaticWarpSpecialization>();
+    });
+}
 ```
 
-| 维度 | 手写 `PassWrapper<PassT, BaseT>` | TableGen 生成基类 `...Base<DerivedT>` |
-| :--- | :--- | :--- |
-| **元数据来源** | C++ 模板参数与原生类型反射 | `Passes.td` 声明式定义文件 |
-| **Options/Stats 支持** | 需手写 `Pass::Option` 字段 | **自动生成强类型成员与 CLI 绑定** |
-| **适用场景** | 内部测试 Pass、临时 Verifier | **生产级公开 Pass、框架核心变换 Pass** |
+该机制使编译器驱动工具（如 `mlir-opt` 或 `triton-opt`）能够通过文本格式的流水线管道描述字符串直接反射解析并动态构造 Pass：
 
-> [!TIP]
-> **总结**：
-> - **CRTP** 在编译期连接基类与派生类，让基类拥有反向感知派生类完整类型的能力；
-> - 配合 **`static_cast`** 与 **延迟实例化**，编译器在 **零额外内存与零虚调用开销** 的前提下，生成 Pass 基础设施。
+```bash
+# 命令行通过文本直接反射构造带有参数配置的 Pass Pipeline：
+mlir-opt --pass-pipeline='builtin.module(triton-gpu-automatic-warp-specialization{num-stages=4})' input.mlir
+```
+
+---
+
+### 4.3 手写 PassWrapper 与 TableGen 生成基类全景对比
+
+| 架构对比维度 | 手写 `PassWrapper<PassT, BaseT>` | TableGen 生成基类 `...Base<DerivedT>` |
+| :--- | :--- | :--- |
+| **元数据与配置来源** | 纯 C++ 模板参数与原生类型反射 | `Passes.td` 声明式 DSL 描述文件 |
+| **CLI 命令行参数绑定** | 需手动在类内声明 `Pass::Option<T>` 字段 | **TableGen 自动生成参数解析、默认值与帮助文档** |
+| **流水线注册支持** | 需手写注册函数代码 | **自动生成 `registerPass` 与管道反射解析适配器** |
+| **工程维护成本** | 随着 Pass 增多容易遗漏样板代码 | **单处 DSL 修改，全工程自动同步生成** |
+| **编译器系统典型适用场景** | 内部单元测试 Pass、私有验证器（Verifier Pass） | **生产级公开 Pass、框架核心优化与降级 Pass** |

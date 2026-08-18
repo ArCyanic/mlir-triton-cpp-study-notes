@@ -1,12 +1,12 @@
-# Triton TensorView 结构化张量视图机制
+# Triton 结构化张量视图核心机制与架构推演
 
-> 本文基于 Triton 源码体系（以 Reexen NPU 等专用加速后端为主线），系统解析结构化张量视图（`TensorView`）的设计动机、ODS 建模、C++ 构造验证、模式提升（`TritonRaiseTensorView`）与硬件降级机制。
+> 本指南深入剖析 Triton 编译器体系中 **`TensorView`（结构化张量视图）** 的设计哲学、TableGen ODS 建模、C++ 构造分层、短路验证机制、`TritonRaiseTensorView` 逆向仿射状态机推导及下游硬件 DMA 降级。
+
+---
 
 ## 1. NPU 结构化张量视图演进
 
 ### 1.1 传统离散指针硬件失配
-
-#### 传统 Triton 前端与 TTIR 的指针模型
 
 在经典 GPU 编程场景中，Triton Python 前端通过直观的张量化指针算术表达块级（Block-level）内存访问：
 
@@ -14,38 +14,39 @@
 @triton.jit
 def vector_add_kernel(x_ptr, n, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)  # 连续或带步长的索引张量
-    mask = offs < n                           # 元素级离散布尔掩码
-    values = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    # 构造离散指针张量与边界布尔掩码
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    # 指针解引用与掩码加载
+    x = tl.load(x_ptr + offsets, mask=mask)
 ```
 
-当上述 Python 代码经过 AST Lowering 生成初始的 Triton 方言 IR（TTIR）时，张量化的加法与加载会被展开为如下的指令序列：
+上述代码经过 Python AST 降级后，在 Triton IR（TTIR）中生成经典的离散指针算术指令序列：
 
 ```mlir
-// 传统 Pointer-style TTIR
-%c256 = arith.constant 256 : i32
-%zero = arith.constant dense<0.000000e+00> : tensor<256xf32>
-%pid = tt.get_program_id x : i32
-%block_start = arith.muli %pid, %c256 : i32
-%range = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+// 初始 Pointer-style TTIR
+%block_start = arith.muli %pid, %c256_i32 : i32
 %starts = tt.splat %block_start : i32 -> tensor<256xi32>
+%range = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
 %offs = arith.addi %starts, %range : tensor<256xi32>
-%limit = tt.splat %n : i32 -> tensor<256xi32>
-%mask = arith.cmpi slt, %offs, %limit : tensor<256xi32>
 
-// 核心：基地址通过 splat 扩展为指针张量，与偏移相加
-%base = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
-%ptrs = tt.addptr %base, %offs : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+// 广播基地址指针并生成 256 个离散指针
+%x_ptrs = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+%ptrs = tt.addptr %x_ptrs, %offs : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+
+// 构造离散布尔掩码
+%splat_n = tt.splat %n : i32 -> tensor<256xi32>
+%mask = arith.cmpi slt, %offs, %splat_n : tensor<256xi32>
+
+// 发起离散指针加载
 %value = tt.load %ptrs, %mask, %zero : tensor<256x!tt.ptr<f32>>
 ```
 
-在 GPU 体系下，这种以 `tensor<256x!tt.ptr<f32>>`（指针张量）和 `tensor<256xi1>`（布尔掩码）为载体的表达具有高度的灵活性，能够自然映射到 GPU 的 SIMT 架构中——硬件上的每个线程各自持有一个独立指针，在掩码单元（Predicate Register）的控制下发起内存事务。
+在 GPU 体系下，这种以 `tensor<256x!tt.ptr<f32>>`（指针张量）和 `tensor<256xi1>`（布尔掩码）为载体的表达具有高度灵活性，能够自然映射到 GPU 的 SIMT 架构中——硬件上的每个线程各自持有一个独立指针，在掩码单元（Predicate Register）控制下发起内存事务。
 
-#### NPU / 专用张量加速器的硬件冲突
+**NPU 与专用张量加速器的硬件冲突**
 
-然而，将上述指针张量 IR 直接交付给 NPU 或非 SIMT 架构的张量加速器时，会引发严重的架构冲突：
-
-```
+```text
 GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 向量模型)
 ┌───────────────────────────────────────┐  ┌───────────────────────────────────────────┐
 │ Thread 0: Load ptr[0]  (if mask[0])   │  │ 2D DMA Engine:                           │
@@ -57,20 +58,18 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
  依赖：离散指针发散与掩码求值               依赖：高维连续/仿射结构描述符
 ```
 
-1. **硬件无离散掩码单元**：
-   - 专用 NPU 通常使用 **2D DMA 控制器** 或 **变长向量加载单元（如 RISC-V Vector / VLEN）** 执行高效的批量数据搬运。
-   - 硬件要求输入的是结构化的**描述符参数**：基地址指针（`Base`）、父张量维度（`Shape`）、内存跨步（`Stride`）以及当前块在全局中的起始坐标（`Offset`）。
-2. **指针张量的信息丢失与逆向成本**：
-   - 在传统的 `tt.addptr` 数据流中，几何结构（一维连续、二维 Strided、块偏移量）被彻底打散为一系列底层的算术操作数，边界信息则被编码进离散的布尔张量 `%mask` 中。
-   - 后端代码生成器若想调用硬件 DMA，必须通过极高成本的模式识别，从 `%ptrs` 和 `%mask` 中逆向推导回原本的几何结构。若无法完美匹配，编译器只能退化为开销巨大的标量循环（Gather/Scatter），导致性能急剧下滑。
+- **硬件缺乏离散掩码执行单元**：专用 NPU 通常使用 **2D DMA 控制器** 或 **变长向量加载单元（如 RISC-V Vector / VLEN）** 执行高效的批量数据搬运。硬件在指令集层面要求输入结构化的**描述符参数**：物理基地址指针（`Base`）、父张量各维几何边界（`Shape`）、内存跨步（`Stride`）以及当前块在全局空间中的起始坐标（`Offset`）；
+- **指针张量的信息丢失与逆向成本**：在传统的 `tt.addptr` 标量/向量算术数据流中，高层几何结构被彻底打散为底层的离散指针偏移序列，边界信息被编码进布尔张量 `%mask` 中。后端代码生成器若想调用硬件 DMA，必须通过极高成本的模式匹配尝试逆向还原几何结构。一旦匹配失败，编译器只能被迫退化为开销巨大的标量循环（Gather/Scatter 串行发射），导致硬件吞吐急剧恶化。
 
 为了从根本上解决这一矛盾，Triton IR 引入了**结构化张量视图（`TensorView`）**。
 
+---
+
 ### 1.2 寻址几何与读写解耦模型
 
-`TensorView` 的核心设计哲学是将**寻址描述（Address Geometry）**与**实际内存读写（Memory Access Effect）**进行彻底解耦。
+`TensorView` 的核心设计哲学是将**寻址描述（Address Geometry）**与**实际内存读写（Memory Access Effect）**进行彻底解耦：
 
-```
+```text
                     ┌─────────────────────────────────────────────────────────┐
                     │               tt.make_tensor_view (纯视图)               │
                     │─────────────────────────────────────────────────────────│
@@ -93,7 +92,7 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
                     └─────────────────────────────────────────────────────────┘
 ```
 
-#### 传统模式 vs 视图模式对比
+传统指针模式与结构化视图模式在操作数组织、边界检查与优化能力上的全景对比如下：
 
 | 维度 | 传统指针模式（`tt.load`） | 结构化视图模式（`tt.make_tensor_view` + `tt.load_view`） |
 | :--- | :--- | :--- |
@@ -102,6 +101,8 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
 | **边界检查方式** | 显式计算每个元素的布尔值 `cmpi slt` | 算子固有属性 `boundaryCheck = array<i32: 0>` 声明需要检查的维度 |
 | **硬件友好度** | 匹配 GPU SIMT 线程掩码执行 | 直接映射为 NPU 2D DMA 硬件描述符或向量长度寄存器 |
 | **Pass 优化能力** | 指针计算与内存效果绑定，难以跨基本块移动 | `make_tensor_view` 具备 `Pure` 特性，可安全外提到循环外部（LICM） |
+
+---
 
 ### 1.3 Generic 与 Pretty 语法视图
 
@@ -153,11 +154,13 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
 > [!NOTE]
 > **方括号的分组实质**：Pretty Syntax 中的 `[%n]`、`[%stride1]` 和 `[%block_start]` 只是语法层面的显示分组。在底层 `Operation` 容器中，它们依然被组织为单一连续的 `SmallVector<Value>`，通过 ODS 生成的 Trait 算法还原区间边界。
 
+---
+
 ### 1.4 MLIR 四维对象正交模型
 
 在 `TensorView` 的设计中，不同维度的数据根据其生命周期、不可变性与所有权归属，被精确分配到了 MLIR 的四大对象子系统中：
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                           MLIR 对象子系统分工矩阵                                 │
 ├──────────────────────┬──────────────────────┬───────────────────────────────────┤
@@ -170,26 +173,25 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
 └──────────────────────┴──────────────────────┴───────────────────────────────────┘
 ```
 
-#### SSA Operands 动态数据流
-- **涵盖字段**：`base`（基地址指针）、`shape`（动态父张量维度）、`strides`（动态步长）、`offsets`（动态块起点）、`padding`（可选填充值）。
-- **生命周期与存储**：作为 `Operation` 的输入操作数，保存在连续的物理数组中，遵循严格的 SSA 数据流依赖关系与支配树（Dominance）约束。
+1. **SSA Operands（动态数据流）**：
+   - 涵盖字段：`base`（基地址指针）、`shape`（动态父张量维度）、`strides`（动态步长）、`offsets`（动态块起点）、`padding`（可选填充值）；
+   - 生命周期与存储：作为 `Operation` 的输入操作数，保存在连续的物理数组中，遵循严格的 SSA 数据流依赖关系与支配树（Dominance）约束。
 
-#### Type Parameters 类型单例
-- **涵盖字段**：`TensorViewType` 中的 `blockType`（如 `tensor<256xf32>`）与 `order`（维度排列，如 `[1, 0]`）。
-- **生命周期与存储**：作为类型定义的不可变参数，进入 `MLIRContext` 内存池的 `TypeStorage` 中参与全局唯一化（Uniquing）。
+2. **Type Parameters（静态类型单例）**：
+   - 涵盖字段：`TensorViewType` 中的 `blockType`（如 `tensor<256xf32>`）与 `order`（维度排列，如 `[1, 0]`）；
+   - 生命周期与存储：作为类型定义的不可变参数，进入 `MLIRContext` 内存池的 `TypeStorage` 中参与全局唯一化（Uniquing）。
+   ```mlir
+   !tt.tensorview<tensor<8x8xf16>>                 // 默认 order = [1, 0]
+   !tt.tensorview<tensor<8x8xf16>, order = [0, 1]> // 另一个独立的 Uniqued 类型单例
+   ```
 
-```mlir
-!tt.tensorview<tensor<8x8xf16>>                 // 默认 order = [1, 0]
-!tt.tensorview<tensor<8x8xf16>, order = [0, 1]> // 另一个独立的 Uniqued 类型单例
-```
+3. **Inherent Properties（算子固有执行契约）**：
+   - 涵盖字段：`load_view` 与 `store_view` 上的 `boundaryCheck`、`cache`（缓存修饰符）、`evict`（驱逐策略）、`isVolatile`；
+   - 生命周期与存储：直接作为 C++ 结构体成员嵌入在 `Operation` 实例分配的 `Properties` 内存块中，随算子的创建、复制与析构而自动管理。
 
-#### Inherent Properties 固有契约
-- **涵盖字段**：`load_view` 与 `store_view` 上的 `boundaryCheck`、`cache`（缓存修饰符）、`evict`（驱逐策略）、`isVolatile`。
-- **生命周期与存储**：直接作为 C++ 结构体成员嵌入在 `Operation` 实例分配的 `Properties` 内存块中，随算子的创建、复制与析构而自动管理。
-
-#### Discardable Attributes 分析属性
-- **涵盖字段**：`tt.contiguity`（连续性长度）、`tt.divisibility`（对齐整除性）、`tt.constancy`（常量性）。
-- **生命周期与存储**：存放于通用的字典属性（`DictionaryAttr`）中。优化 Pass 即使在变换过程中丢弃这些属性，也不会破坏程序的功能正确性（仅使后续 Pass 采取保守假设）。
+4. **Discardable Attributes（辅助分析优化提示）**：
+   - 涵盖字段：`tt.contiguity`（连续性长度）、`tt.divisibility`（对齐整除性）、`tt.constancy`（常量性）；
+   - 生命周期与存储：存放于通用的字典属性（`DictionaryAttr`）中。优化 Pass 即使在变换过程中丢弃这些属性，也不会破坏程序的功能正确性（仅使后续 Pass 采取保守假设）。
 
 ```mlir
 // Generic IR 中属性与固有状态的边界定界：
@@ -205,11 +207,11 @@ GPU (SIMT 模型)                            NPU / 专用张量加速器 (DMA / 
 > 2. `blockType` 决定了加载产生的结果 Tensor 形状与元素类型，因此必须作为静态 **Type Parameter**；
 > 3. `boundaryCheck` 描述了执行该次访存时硬件是否需要激活边界截断逻辑，属于该算子的**固有执行契约**，因此进入 `Properties`。
 
+---
+
 ## 2. ODS 建模与底层契约推演
 
 ### 2.1 TensorViewType 编译期唯一化
-
-#### ODS 定义与参数建模
 
 在 `TritonTypes.td` 中，`TensorViewType` 作为 Triton Dialect 的核心类型定义如下：
 
@@ -247,14 +249,11 @@ def TT_TensorViewType : TritonTypeDef<"TensorView", "tensorview", []> {
 }
 ```
 
-#### order 维度排列物理意义
+#### order 维度排列的物理意义与内存深拷贝
 
-- **`order` 语义契约**：按照**物理内存地址变化速度从快到慢**排列各维度索引（Fastest-changing dimension first）。
-  - 例如对于 2D 行主序矩阵（Row-major，第 1 维列连续、步长为 1），其地址变化最快的维度是 Dim 1，因此 `order = [1, 0]`。
-  - 对于 3D 行主序张量，其 `order = [2, 1, 0]`。
-- **默认排序算法**：`getDefaultOrder(rank)` 固定生成递减序列 `[rank-1, ..., 0]`。
-- **`ArrayRefParameter<"int32_t">` 的内存协议**：
-  - `order` 是一个动态长度的整数数组。在类型唯一化（Type Uniquing）构造阶段，MLIR 自动生成的 `TensorViewTypeStorage::construct` 会调用 `allocator.copyInto(order)` 将调用者传入的临时栈数组完整**深拷贝到 `MLIRContext` 托管的 BumpPtrAllocator 内存池中**，确保类型句柄在跨 Pass 传递时内部指针始终有效。
+- **`order` 语义契约**：按照**物理内存地址变化速度从快到慢**排列各维度索引（Fastest-changing dimension first）。例如对于 2D 行主序矩阵（Row-major，第 1 维列连续、步长为 1），其地址变化最快的维度是 Dim 1，因此 `order = [1, 0]`；对于 3D 行主序张量，其 `order = [2, 1, 0]`；
+- **默认排序算法**：`getDefaultOrder(rank)` 固定生成递减序列 `[rank-1, ..., 0]`；
+- **`ArrayRefParameter<"int32_t">` 的内存协议**：`order` 是一个动态长度的整数数组。在类型唯一化（Type Uniquing）构造阶段，MLIR 自动生成的 `TensorViewTypeStorage::construct` 会调用 `allocator.copyInto(order)` 将调用者传入的临时栈数组完整**深拷贝到 `MLIRContext` 托管的 BumpPtrAllocator 内存池中**，确保类型句柄在跨 Pass 传递时内部指针始终有效。
 
 #### verify 对 order 的排列约束
 
@@ -267,10 +266,9 @@ LogicalResult TensorViewType::verify(
   int64_t rank = blockType.getRank();
   
   // 1. 维度长度一致性校验
-  if (static_cast<int64_t>(order.size()) != rank) {
-    return emitError() << "tensorview order has " << order.size()
-                       << " entries but the block type has rank " << rank;
-  }
+  if (static_cast<int64_t>(order.size()) != rank)
+    return emitError() << "tensorview order size (" << order.size()
+                       << ") does not match block rank (" << rank << ")";
 
   // 2. [0, rank) 全排列合法性校验（禁止越界与重复）
   SmallVector<bool> seen(rank, false);
@@ -286,31 +284,11 @@ LogicalResult TensorViewType::verify(
 }
 ```
 
-### 2.2 MakeTensorViewOp 特征约束
+---
 
-`MakeTensorViewOp` 是构建视图句柄的纯描述性算子。为了让编译器能够充分理解并优化该算子，ODS 为其声明了三大核心 Trait：
+### 2.2 MakeTensorViewOp 核心 Traits 深度剖析
 
-```tablegen
-def TT_MakeTensorViewOp : TT_Op<"make_tensor_view", [
-    Pure,
-    SameVariadicOperandSize,
-    TypesMatchWith<"infer the base pointer type from the result tensorview type",
-                   "result", "base",
-                   "getPointerType(::mlir::cast<::mlir::triton::TensorViewType>($_self).getBlockType().getElementType(), getAddressSpace($_self))">
-  ]> {
-  let arguments = (ins
-    TT_Ptr:$base,
-    Variadic<AnySignlessIntegerOrIndex>:$shape,
-    Variadic<I64>:$strides,
-    Variadic<AnySignlessIntegerOrIndex>:$offsets
-  );
-  let results = (outs TT_TensorViewType:$result);
-  let assemblyFormat = "$base `,` `[` $shape `]` `,` `[` $strides `]` `,` `[` $offsets `]` attr-dict `:` type($result) `,` `[` type($shape) `]` `,` `[` type($offsets) `]`";
-  let hasVerifier = 1;
-}
-```
-
-```
+```text
                         MakeTensorViewOp 核心 Trait 架构矩阵
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ 1. Pure (AlwaysSpeculatable + NoMemoryEffect)                                   │
@@ -325,26 +303,18 @@ def TT_MakeTensorViewOp : TT_Op<"make_tensor_view", [
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Pure 特征循环外提优化
+#### Pure Trait 与 Loop Hoist 优化保证
 
 `Pure` 是 `AlwaysSpeculatable`（永远允许投机执行）与 `NoMemoryEffect`（零内存副作用）的组合：
 
-```tablegen
-def AlwaysSpeculatable : TraitList<[ConditionallySpeculatable, AlwaysSpeculatableImplTrait]>;
-def NoMemoryEffect : MemoryEffects<[]>;
-def Pure : TraitList<[AlwaysSpeculatable, NoMemoryEffect]>;
-```
-
-- **投机执行保证（Speculatability）**：`make_tensor_view` 仅在 SSA 寄存器层面组合几何参数，不解引用任何物理指针。即使位于从未执行的分支路径或循环内部，只要输入 SSA 可用，提前计算该 View 绝不会引发硬件异常（如非法地址访问或浮点异常）。
+- **投机执行保证（Speculatability）**：`make_tensor_view` 仅在 SSA 寄存器层面组合几何参数，不解引用任何物理指针。即使位于从未执行的分支路径或循环内部，只要输入 SSA 可用，提前计算该 View 绝不会引发硬件异常；
 - **循环外提收益（LICM）**：当循环内的 `shape`, `strides`, `offsets` 不随迭代变化时，编译器可安全将 `make_tensor_view` 提升至循环前置块（Preheader），避免在每次循环迭代中重复构造 View 描述符。
 
-#### SameVariadicOperandSize 等长分段
+#### SameVariadicOperandSize 扁平操作数等长分段算法
 
-底层 `mlir::Operation` 的操作数物理结构是一维扁平数组 `SmallVector<Value>`。`MakeTensorViewOp` 包含 1 个固定操作数（`base`）和 3 个变长操作数（`shape`, `strides`, `offsets`）。
+底层 `mlir::Operation` 的操作数物理结构是一维扁平数组 `SmallVector<Value>`。`MakeTensorViewOp` 包含 1 个固定操作数（`base`）和 3 个变长操作数（`shape`, `strides`, `offsets`）。为了在不借助额外属性的前提下精确定位各字段在扁平数组中的起始位置与长度，ODS 采用了等长公式算法：
 
-为了在不借助额外属性的前提下精确定位各字段在扁平数组中的起始位置与长度，ODS 采用了等长公式算法：
-
-```
+```text
 静态字段：  base   │ shape          │ strides        │ offsets
 物理分布：  0      │ 1 ... R        │ R+1 ... 2R     │ 2R+1 ... 3R
            └──────┴────────────────┴────────────────┴─────────────┘
@@ -374,6 +344,8 @@ ValueRange getStrides() { return getODSOperands(2); } // 对应区间 [1+R, 1+2R
 ValueRange getOffsets() { return getODSOperands(3); } // 对应区间 [1+2R, 1+3R)
 ```
 
+**多组变长操作数分段机制对比**：
+
 | 机制对比 | `AttrSizedOperandSegments` | `SameVariadicOperandSize`（TensorView 选型） |
 | :--- | :--- | :--- |
 | **元数据存储** | 需在算子上附加 `operandSegmentSizes` 属性字典 | **零属性开销**（纯算术推导，无任何额外内存负载） |
@@ -383,7 +355,7 @@ ValueRange getOffsets() { return getODSOperands(3); } // 对应区间 [1+2R, 1+3
 > [!WARNING]
 > **操作数总数硬契约**：该机制要求操作数总数必须严格满足公式 $\text{NumOperands} = 1 + 3R$。如果手动构造 IR 时传入了长度不一致的 `shape` 与 `strides`，整除截断会导致 getter 提取到错误的内存切片。
 
-#### TypesMatchWith 双向类型约束
+#### TypesMatchWith 双向类型约束与 Parser 推导
 
 `TypesMatchWith` 建立起了 `result`（`TensorViewType`）与 `base`（`PointerType`）之间的强类型约束：
 
@@ -394,10 +366,8 @@ TypesMatchWith<"infer the base pointer type from the result tensorview type",
 ```
 
 该 Trait 在编译器生成代码中承担双重使命：
-
 1. **自动生成不变式校验（Invariant Verification）**：
    ```cpp
-   // MakeTensorViewOp::verifyInvariantsImpl() 中的自动生成逻辑：
    Type expectedBaseType = getPointerType(
        cast<TensorViewType>(getResult().getType()).getBlockType().getElementType(),
        getAddressSpace(getResult().getType()));
@@ -405,12 +375,33 @@ TypesMatchWith<"infer the base pointer type from the result tensorview type",
    if (expectedBaseType != getBase().getType())
      return emitOpError("failed to verify that base pointer matches result element type");
    ```
-2. **支持声明式语法解析器（Declarative Assembly Parser）**：
-   在 Pretty Syntax 中，冒号后仅打印了结果类型 `type($result)`，省略了 `type($base)`。Parser 借助 `TypesMatchWith` 保存的变换表达式，在解析阶段直接推导出 `base` 的预期指针类型，完成 `parser.resolveOperands(baseOperands, expectedBaseType, ...)`。
+2. **支持声明式语法解析器（Declarative Assembly Parser）**：在 Pretty Syntax 中，冒号后仅打印了结果类型 `type($result)`，省略了 `type($base)`。Parser 借助 `TypesMatchWith` 保存的变换表达式，在解析阶段直接推导出 `base` 的预期指针类型，完成 `parser.resolveOperands(baseOperands, expectedBaseType, ...)`。
 
-### 2.3 固有属性及内存副作用约束
+---
 
-与纯视图构建不同，`LoadViewOp` 和 `StoreViewOp` 是真正产生内存交互的算子。
+### 2.3 固有属性与 LLVM 描述符 ABI 布局
+
+#### LLVM 降级描述符结构体内存拓扑
+
+当 `tt.tensorview` 经过方言转换（Dialect Conversion）最终降级到 LLVM IR 时，抽象的编译期视图类型会被物化为一个**C 兼容的扁平描述符结构体（TensorView Descriptor Struct）**：
+
+```text
+               TensorView Descriptor 64 位物理内存排布 (Rank = 2, 总计 56 字节)
+ 字节偏移 (Offset)
+ 0x00 ┌────────────────────────────────────────────────────────────┐
+      │  void *base (8 字节物理内存首地址裸指针)                    │  8 Bytes
+ 0x08 ├────────────────────────────┬───────────────────────────────┤
+      │  int64_t shape[0] (8 Bytes)│  int64_t shape[1] (8 Bytes)   │  16 Bytes
+ 0x18 ├────────────────────────────┼───────────────────────────────┤
+      │  int64_t stride[0] (8B)    │  int64_t stride[1] (8 Bytes)  │  16 Bytes
+ 0x28 ├────────────────────────────┼───────────────────────────────┤
+      │  int64_t offset[0] (8B)    │  int64_t offset[1] (8 Bytes)  │  16 Bytes
+ 0x38 └────────────────────────────────────────────────────────────┘ (sizeof == 56 Bytes)
+```
+
+该结构体在 C++ ABI 层面由寄存器组直接承载传递，完全消除了任何动态堆内存分配。
+
+与纯视图构建不同，`LoadViewOp` 和 `StoreViewOp` 是真正产生内存交互的算子：
 
 ```tablegen
 def TT_LoadViewOp : TT_Op<"load_view", [
@@ -462,9 +453,10 @@ void LoadViewOp::getEffects(
 }
 ```
 
-- **编译优化控制**：
-  - `MemRead<GlobalMemory>` 阻止了包含读写依赖的非法指令重排；
-  - 与 `MakeTensorViewOp` 的 `Pure` 形成鲜明对比，确立了“**几何构造可任意调度，内存读写严格受控**”的编译器优化边界。
+- `MemRead<GlobalMemory>` 阻止了包含读写依赖的非法指令重排；
+- 与 `MakeTensorViewOp` 的 `Pure` 形成鲜明对比，确立了“**几何构造可任意调度，内存读写严格受控**”的编译器优化边界。
+
+---
 
 ## 3. C++ 构造分层与短路验证
 
@@ -472,7 +464,7 @@ void LoadViewOp::getEffects(
 
 在编写编译器 Pass 或前端 Lowering 时，开发者通常持有不同层级的信息（例如有时持有静态张量形状，有时已构建好结果类型）。`MakeTensorViewOp` 在 C++ 端实现了一套清晰的**四层 Builder 归一化流水线（Normalization Pipeline）**：
 
-```
+```text
                     MakeTensorViewOp 四层 Builder 归一化流水线
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. Convenience A (默认 order)                                               │
@@ -497,9 +489,10 @@ void LoadViewOp::getEffects(
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 四层 Builder 核心实现与转发
+四层 Builder 的具体实现与参数转发逻辑如下：
 
 **第 1 层：Convenience A（单形状入口，补齐默认 Order）**
+
 ```cpp
 void MakeTensorViewOp::build(
     OpBuilder &builder, OperationState &state,
@@ -512,6 +505,7 @@ void MakeTensorViewOp::build(
 ```
 
 **第 2 层：Convenience B（显式 Order 入口，推导结果类型）**
+
 ```cpp
 void MakeTensorViewOp::build(
     OpBuilder &builder, OperationState &state,
@@ -533,6 +527,7 @@ void MakeTensorViewOp::build(
 ```
 
 **第 3 层：Normalized C（强类型标准入口，写入 State）**
+
 ```cpp
 // 由 ODS 自动生成：接收已确定的 resultType 与结构化命名参数
 void MakeTensorViewOp::build(OpBuilder &, OperationState &state,
@@ -548,6 +543,7 @@ void MakeTensorViewOp::build(OpBuilder &, OperationState &state,
 ```
 
 **第 4 层：Generic D（底层扁平入口）**
+
 ```cpp
 // 接收完全展平的 flatOperands 与 resultTypes，供通用反序列化或 Bytecode 使用
 void MakeTensorViewOp::build(
@@ -560,11 +556,13 @@ void MakeTensorViewOp::build(
 }
 ```
 
+---
+
 ### 3.2 OperationState 生命周期演变
 
-在 C++ 层面构造算子时，理解 `create` 静态工厂与 `build` 填充函数的分工至关重要：
+在 C++ 层面构造算子时，`create` 静态工厂与 `build` 填充函数的分工与协作生命周期如下：
 
-```
+```text
 调用 MakeTensorViewOp::create(builder, loc, base, shape, strides, offsets, tensorShape, order)
   │
   ├─► 1. 初始化中间状态：OperationState state(loc, "tt.make_tensor_view")
@@ -582,14 +580,14 @@ void MakeTensorViewOp::build(
 | :--- | :--- | :--- |
 | **`OperationState`** | 算子实例化前的临时暂存容器（栈对象） | 可变（Mutable），随 `build` 填充逐步累加参数 |
 | **`build(...)`** | 纯状态填充逻辑 | 不分配 `Operation` 内存，仅向 `OperationState` 追加操作数与类型 |
-| **`builder.create(state)`** | 物理实体创建与 IR 插入 | 在堆/Arena 上分配 `Operation` 物理节点，并插入到当前基本块的游标位置 |
+| **`builder.create(state)`** | 物理实体创建与 IR 插入 | 在堆/Arena 上分配 `Operation` 物理节点并插入当前基本块游标位置 |
 | **`create(...)` 静态工厂** | 面向调用者的便捷门面（Facade） | 自动整合“状态初始化 $\rightarrow$ 调度 `build` $\rightarrow$ 实体分配 $\rightarrow$ 句柄转换” |
 
-### 3.3 双重短路验证机制
+---
 
-当调用 `mlir::verify(op)` 或 PassManager 执行 IR 校验阶段时，MLIR 为 `MakeTensorViewOp` 建立了包含自动生成不变式与手写语义的双重安全防线：
+### 3.3 双重验证防线与短路验证机制
 
-```
+```text
                     MakeTensorViewOp::verifyInvariants()
                                      │
                                      ▼
@@ -609,8 +607,6 @@ void MakeTensorViewOp::build(
                                        └──────────────────────────────────────────────────┘
 ```
 
-#### verifyInvariants 自动组合入口
-
 ```cpp
 LogicalResult MakeTensorViewOp::verifyInvariants() {
   // 核心：短路逻辑运算符 &&
@@ -620,9 +616,8 @@ LogicalResult MakeTensorViewOp::verifyInvariants() {
 }
 ```
 
-#### 为什么必须采用 `&&` 短路顺序？
-
-1. **类型安全前提**：`verifyInvariantsImpl()` 首先确认了 `getResult().getType()` 100% 满足 `TT_TensorViewType` 约束，以及 `base` 与 `result` 元素类型的一致性。
+采用 `&&` 顺序进行短路执行的核心原因包括：
+1. **类型安全前提**：`verifyInvariantsImpl()` 首先确认了 `getResult().getType()` 100% 满足 `TT_TensorViewType` 约束，以及 `base` 与 `result` 元素类型的一致性；
 2. **手写 Verifier 免除防御性判断**：在第 2 步的 `verify()` 实现中，开发者可以直接安全地进行 `cast<TensorViewType>` 强转，而无需使用耗时且冗余的 `dyn_cast` 判空：
 
 ```cpp
@@ -642,13 +637,15 @@ LogicalResult MakeTensorViewOp::verify() {
 }
 ```
 
+---
+
 ## 4. TritonRaiseTensorView 逆向提升
 
-### 4.1 Pass 架构与硬契约管线
+### 4.1 Pass 架构定位与硬契约管线
 
-`TritonRaiseTensorView`（对应源码 `lib/Dialect/Triton/Transforms/RaiseTensorView.cpp`）是连接前端经典指针算术与后端结构化张量优化的核心编译桥梁。
+`TritonRaiseTensorView`（对应源码 `lib/Dialect/Triton/Transforms/RaiseTensorView.cpp`）是连接前端经典指针算术与后端结构化张量优化的核心编译桥梁：
 
-```
+```text
               TritonRaiseTensorView 在编译流水线中的定位
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. 前端 Python JIT 生成初始 Pointer-style TTIR                              │
@@ -669,15 +666,13 @@ LogicalResult MakeTensorViewOp::verify() {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 硬契约与保守原则（No Legacy Fallback）
-
-该 Pass 遵循严格的防御性架构契约：
+**硬契约与保守原则（No Legacy Fallback）**：
 - **完全提阶或显式报错**：针对所有可以清晰解码为仿射多维块的访问，100% 提升为 `TensorView`；
 - **拒绝静默残留**：若代码中存在不可解析的非结构化访存（如数据依赖的间接寻址 Gather/Scatter、取模回绕等），Pass 会抛出硬性编译错误，绝不静默放过未被提升的 legacy 指针指令，防止在后端代码生成阶段产生隐蔽的性能陷阱。
 
-### 4.2 PtrState 仿射状态逆向解码
+---
 
-#### PtrState 状态结构体
+### 4.2 PtrState 仿射状态逆向解码
 
 Pass 在遍历指针算术时，通过内部结构体 `PtrState` 维护当前 SSA 值的仿射几何描述：
 
@@ -695,19 +690,19 @@ struct PtrState {
 
 #### visitPtr 递归状态转移表
 
-`visitPtr` 从 `tt.load` 的指针输入操作数出发，沿着 SSA `Def-Use` 链逆向回溯，应用以下状态转移方程：
-
 | 匹配到的算子（Defining Op） | 仿射状态转移逻辑（State Transition） | 物理几何意义 |
 | :--- | :--- | :--- |
-| **`tt.make_range {start, end}`** | $\text{offsets}[0] = \text{start}$<br>$\text{strides}[0] = 1$<br>$\text{sizes}[0] = \text{end} - \text{start}$ | 引入 1 维单位连续步长（Unit-stride）的基础序列 |
-| **`tt.splat %val`** | $\text{offsets}[d] = \%\text{val}$<br>$\text{strides}[d] = 0$<br>$\text{sizes}[d] = \text{dimSize}$ | 引入广播标量，所有维度的步长初始化为 0（Uniform） |
-| **`arith.addi %lhs, %rhs`** | $\text{offsets}[d] = \text{lhs.offsets}[d] + \text{rhs.offsets}[d]$<br>$\text{strides}[d] = \text{lhs.strides}[d] + \text{rhs.strides}[d]$ | 叠加两个仿射表达式（如块基地址 + 局部偏移） |
-| **`arith.muli %lhs, %cst`** | $\text{offsets}[d] = \text{lhs.offsets}[d] \times \%\text{cst}$<br>$\text{strides}[d] = \text{lhs.strides}[d] \times \%\text{cst}$ | 线性缩放步长（如多维行主序展开中的乘外层维度 Stride） |
+| **`tt.make_range {start, end}`** | $\text{offsets}[0] = \text{start}$, $\text{strides}[0] = 1$, $\text{sizes}[0] = \text{end} - \text{start}$ | 引入 1 维单位连续步长（Unit-stride）的基础序列 |
+| **`tt.splat %val`** | $\text{offsets}[d] = \%\text{val}$, $\text{strides}[d] = 0$, $\text{sizes}[d] = \text{dimSize}$ | 引入广播标量，所有维度的步长初始化为 0（Uniform） |
+| **`arith.addi %lhs, %rhs`** | $\text{offsets}[d] = \text{lhs.offsets}[d] + \text{rhs.offsets}[d]$, $\text{strides}[d] = \text{lhs.strides}[d] + \text{rhs.strides}[d]$ | 叠加两个仿射表达式（如块基地址 + 局部偏移） |
+| **`arith.muli %lhs, %cst`** | $\text{offsets}[d] = \text{lhs.offsets}[d] \times \%\text{cst}$, $\text{strides}[d] = \text{lhs.strides}[d] \times \%\text{cst}$ | 线性缩放步长（如多维行主序展开中的乘外层维度 Stride） |
 | **`tt.expand_dims %src {axis}`** | 在 $\text{offsets}, \text{strides}, \text{sizes}$ 的 `axis` 位置插入 1 维单例 $\text{size}=1, \text{stride}=0$ | 增加未广播的虚拟维度 |
 | **`tt.broadcast %src`** | 将 $\text{sizes}[d] = 1$ 的维度扩展为目标形状，保持 $\text{strides}[d] = 0$ | 多维张量广播（如行向量广播为 2D 矩阵） |
 | **`tt.addptr %base, %offset`** | 设置 $\text{state.base} = \%\text{base}$，将 `%offset` 的解码结果吸收至 `state` | 捕获物理指针基地址 |
 
-```
+#### 一维逆向回溯推导示例
+
+```text
                                   visitPtr 逆向回溯推导示例 (一维)
   %ptrs = tt.addptr %base, %offs
               │
@@ -724,11 +719,11 @@ struct PtrState {
                                                        state.sizes[0]   = 256
 ```
 
-#### 二维仿射状态代数推演全景跟踪（2D Vector State Trace）
+#### 二维仿射状态代数推演全景跟踪
 
 在 2D Strided 访存（如 Tile $16 \times 32$）中，前端会分别构造行索引与列索引，并通过 `expand_dims` + `broadcast` 提升至 2D 网格，最后通过 `addi` 叠加。`visitPtr` 逆向推导的代数向量演化过程如下：
 
-```
+```text
 1. 行路径 (Row Path: 16):
    tt.make_range(0, 16)               ──► offsets=[0],      strides=[1],           sizes=[16]
    tt.expand_dims(axis=1)             ──► offsets=[0, 0],   strides=[1, 0],        sizes=[16, 1]
@@ -753,7 +748,9 @@ struct PtrState {
    base    = %ptr
 ```
 
-### 4.3 边界掩码仿射解析
+---
+
+### 4.3 边界掩码仿射解析与组装
 
 在传统 TTIR 中，边界控制是通过 `arith.cmpi slt, %offs, %limit` 生成的布尔张量表达的。Pass 必须将该数据流反解为两项结构化信息：
 1. **父张量的实际维度边界（Parent Shape）**；
@@ -777,8 +774,6 @@ LogicalResult parseMask(Value mask, SmallVectorImpl<Value> &dimBound) {
 }
 ```
 
-#### 组装 `MakeTensorViewOp` 与 `LoadViewOp`
-
 在收集完 `PtrState` 与 `dimBound` 后，Pass 在汇合点执行最终组装：
 
 ```cpp
@@ -799,11 +794,13 @@ for (int64_t d = 0; d < rank; ++d) {
 }
 ```
 
+---
+
 ### 4.4 端到端 IR 提升时空对照
 
 以一个二维 Strided 矩阵块读取（Tile $16 \times 32$，带二维边界保护）为例，对比提升前后的 IR 结构：
 
-#### 提升前：Pointer-style TTIR（离散算术与掩码）
+#### 提升前 Pointer-style TTIR
 
 ```mlir
 // 初始 Pointer-style TTIR
@@ -832,7 +829,7 @@ for (int64_t d = 0; d < rank; ++d) {
 %val = tt.load %ptrs, %mask, %zero : tensor<16x32x!tt.ptr<f32>>
 ```
 
-#### 提升后：结构化 TensorView IR
+#### 提升后 结构化 TensorView IR
 
 ```mlir
 // 经过 TritonRaiseTensorView 提升后的精炼 IR
@@ -858,24 +855,17 @@ for (int64_t d = 0; d < rank; ++d) {
 | `%mask_h` 与 `%mask_w`（`cmpi slt`） | 声明两维均存在父张量越界保护需求 | `boundaryCheck = array<i32: 0, 1>` |
 | `%val = tt.load %ptrs, %mask, %zero` | 实际物理读操作与越界填充值 | `tt.load_view %view, %zero` |
 
-> [!TIP]
-> **提升带来的编译收益**：
-> 1. **代码体积骤降**：原本用于构造指针网格的 15+ 条展开与广播指令全部被折叠，IR 紧凑度显著提高；
-> 2. **硬件语义完备**：`[%H, %W]`、`[%stride_h, 1]` 和 `boundaryCheck = [0, 1]` 构成了完备的硬件描述符，后端无需任何反推即可直接发射 2D DMA 指令。
+---
 
 ## 5. 硬件降级物化与 DMA 驱动
 
 ### 5.1 结构化视图块循环物化
 
-#### 硬件向量长度（VLEN）与前端 Tile 的失配矛盾
+在实际 NPU 硬件上，片上向量寄存器或 SRAM 缓冲区的物理容量通常受限：前端定义的算法分块可能为 $128 \times 256$，但底层向量执行单元的单指令向量长度可能仅为 64（Chunk Size = 64）。结构化 `TensorView` 在进入底层代码生成前，经历**物理分块循环物化（Chunk Loop Materialization）**：
 
-在实际 NPU 硬件上，片上向量寄存器或 SRAM 缓冲区的物理容量通常受限：
-- 前端 Python 开发者定义的算法分块可能为 $128 \times 256$；
-- 但底层向量执行单元（如 RISC-V RVV）的每次最大单指令向量长度可能仅为 64 个元素（Chunk Size = 64）。
+#### 读取视图循环物化
 
-因此，结构化 `TensorView` 在进入底层代码生成前，必须经历一次**物理分块循环物化（Chunk Loop Materialization）**。
-
-```
+```text
 tt.load_view %view (128x256)
   │
   ├─► Pass: triton-materialize-chunk-loops
@@ -915,11 +905,11 @@ scf.for %i = 0 to 128 step 1 {
 1. **边界条件解析简化**：尾部不完整 Chunk 的边界处理无需在每条指令上重新计算 `cmpi` 掩码，而是通过简单的算术截断（`affine.min` 计算剩余元素数量）直接更新硬件向量长度寄存器（`vsetvl`）；
 2. **多维地址自动线性化**：利用 `order` 信息，Pass 总是优先沿着地址最连续的物理维度（Fastest-changing axis）进行步长迭代，保证向量加载始终命中连续内存行。
 
+---
+
 ### 5.2 2D DMA 硬件描述符降级
 
 在将方言最终转换至 LLVM 方言（`TritonReexenNPUToLLVM`）阶段，`tt.load_view` 和 `tt.store_view` 会直接映射为**硬件 DMA 传输调用**或**底层内联汇编指令**。
-
-#### 2D DMA 硬件描述符构建示例
 
 对于二维的 `load_view` 操作，Lowering Pass 在栈上分配并填充标准的硬件 DMA 描述符（DMA Descriptor）：
 
@@ -943,11 +933,13 @@ llvm.call @reexen_dma_submit_2d(%desc) : (!llvm.ptr) -> ()
 llvm.call @reexen_dma_wait(%desc) : (!llvm.ptr) -> ()
 ```
 
-### 5.3 张量视图全景心智模型
+---
 
-回顾整个 Triton `TensorView` 的生命周期，其编译流向构成了一条清晰的“**由散到整、再由整到硬**”的架构推导链路：
+### 5.3 结构化访存编译流向与设计总结
 
-```
+回顾整个 Triton `TensorView` 的生命周期，其编译流向构成了一条“**由散到整、再由整到硬**”的清晰推导链路：
+
+```text
                               Triton 结构化访存生命周期全景
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 1. Python 源码表达                                                          │
@@ -982,8 +974,7 @@ llvm.call @reexen_dma_wait(%desc) : (!llvm.ptr) -> ()
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 核心设计总结
-
-1. **寻址与副作用分离**：`tt.make_tensor_view`（纯几何、`Pure`、可外提）与 `tt.load_view`（物理读、细粒度副作用）明确了编译优化的安全边界。
-2. **声明式 ODS 契约保障**：`SameVariadicOperandSize` 解决了多组可变参数的物理扁平化存储；`TypesMatchWith` 确保了类型系统在验证与语法解析中的双向自洽。
+**三大核心设计总结**：
+1. **寻址与副作用分离**：`tt.make_tensor_view`（纯几何、`Pure`、可外提）与 `tt.load_view`（物理读、细粒度副作用）明确了编译优化的安全边界；
+2. **声明式 ODS 契约保障**：`SameVariadicOperandSize` 解决了多组可变参数的物理扁平化存储；`TypesMatchWith` 确保了类型系统在验证与语法解析中的双向自洽；
 3. **逆向仿射提阶的鲁棒性**：`TritonRaiseTensorView` 使得 Triton 能够继续保持 Python 前端指针算术的表达灵活性，同时在编译器后端为专有硬件还原出完整的 DMA 结构化参数。
