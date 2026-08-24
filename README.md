@@ -39,6 +39,7 @@
 | **04** | [闭包、递归 Lambda 与类型擦除](cpp-basic/lambdas-closures-and-type-erasure.md) | 闭包仿函数生成、广义移动捕获、Y-Combinator / Deducing this、`std::function` 虚表与 SBO 小对象优化 |
 | **05** | [模板元编程、SFINAE 与 Concepts](cpp-basic/templates-sfinae-and-concepts.md) | 两阶段名字查找、`std::enable_if_t`、`std::void_t` 探测、`if constexpr`、Concepts 偏序决议 |
 | **06** | [编译流水线、链接模型与 ELF](cpp-basic/compiler-toolchain-and-elf-linking.md) | 编译四阶段、链接属性（External/Internal）、ELF Section/Segment、`extern "C"`、`.init_array`、静态库链接顺序 |
+| **07** | [RISC-V 虚拟内存与编译工具链全景推演](cpp-basic/riscv-address-space-and-toolchain.md) | XLEN 与定长指令正交性、`medlow` 与 `medany`、`Elf64_Rela` 显式加数修补、`PT_LOAD` 虚存映射、SV39 多级页表与 MMU 硬件翻译 |
 
 ### 2. MLIR 定制 C++ 架构基础设施 (cpp-mlir/)
 

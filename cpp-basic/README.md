@@ -13,6 +13,7 @@
 | **04** | [闭包、递归 Lambda 与类型擦除](lambdas-closures-and-type-erasure.md) | Lambda 编译器生成类原理？递归 Lambda 如何零开销实现？`std::function` 如何擦除类型？ | 闭包仿函数生成、广义移动捕获、Y-Combinator / Deducing this、`std::function` 虚表与 SBO 小对象优化 |
 | **05** | [模板元编程、SFINAE 与 Concepts](templates-sfinae-and-concepts.md) | 模板两阶段查找与 ODR 规则？SFINAE 如何探测成员？C++20 Concepts 如何优化编译诊断？ | 两阶段查找、`std::enable_if_t`、`std::void_t` / `declval` 探测、`if constexpr` 分支修剪、Concepts 偏序决议 |
 | **06** | [编译流水线、链接模型与 ELF](compiler-toolchain-and-elf-linking.md) | 源码到二进制经历哪四阶段？ELF 节区如何分布？Name Mangling 与静态库链接顺序为何敏感？ | 编译四阶段、链接属性（External/Internal）、ELF Section/Segment、`extern "C"`、`.init_array` 构造链、单遍扫描算法 |
+| **07** | [RISC-V 虚拟内存与编译工具链全景推演](riscv-address-space-and-toolchain.md) | 64 位地址如何在 32 位定长指令、虚拟内存与 MMU 翻译中闭环？medany 与 RELA 为何协同？ | XLEN 与定长指令正交性、`medlow` 与 `medany`、`Elf64_Rela` 显式加数修补、`PT_LOAD` 虚存映射、SV39 多级页表与 MMU 硬件翻译 |
 
 ## 知识分层与关联导航
 
