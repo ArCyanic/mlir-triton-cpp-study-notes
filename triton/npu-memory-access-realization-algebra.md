@@ -509,6 +509,28 @@ uniform cache base 加连续行，已经由 RVV 正确执行；flash layout 在�
 连续或常 stride run。这部分应交给 TMA descriptor/box realization，而不是为了让 RVV 覆盖
 所有 cache layout 引入 masked scatter。
 
+### 跨归约存活：宽值必须成为 staged realization
+
+FlagGems `fused_add_rms_norm` 把 F32 中间值 `x+r` 同时用于三件事：写回 BF16 residual、
+计算标量方差、以及方差归约后的归一化。单独规划每个 store/reduce 会在后续 stage 重新遍历
+producer DAG；此时 residual 已被早期 store 改写，所谓 rematerialization 实际变成再次相加。
+这不是 replica 或 gather 问题，而是值的生命周期跨过了 scalar/effect barrier。
+
+现在同一 realization 显式生成三个 stage：第一阶段归约原始 F32 sum；第二阶段重新计算一次
+sum，同时将完整 F32 位值写入 program-private scratch、将转换后的值写入公开 residual；第三
+阶段从 scratch 恢复精确值并完成归一化。scratch store 与公开 store 先共享 chunk value，后
+统一提交 effects，因此不存在一个 store 改写另一个 store 的输入。Reexen 将 TTNPU 的
+`global_scratch_alloc` 接到隐藏 runtime 参数；scratch 按物理 core 切片，同一 core 顺序执行的
+逻辑 program 可以复用它。未来换成 L1/TMA placement 时，staged realization 本身不变。
+
+这次实测还揭示了更底层的 ownership 缺口：设备会在八个物理 core 上启动同一 kernel，旧
+`MaterializeProgramLoops` 却让每个 core 遍历完整逻辑 grid。out-of-place kernel 多次写同值，
+长期掩盖了问题；原地 add 明确表现为一次 launch 累加八次。现在有 program-id 的最低维 grid
+循环采用 `core_id; step=core_num` 分片，没有 program-id 的 singleton domain 只由 core 0
+执行。原地 add 从 10 恢复到 3，原生 BF16 fused-add RMSNorm 与完整 DSV4 QNorm+RoPE+KV
+insert 随之逐位正确。物理 core ownership 因此属于 program-domain realization，不属于某个
+算子的访存或 replica 策略。
+
 ### Embedding 前向
 
 row index 来自一次 scalar load，但对当前 vector slot 一致。MARA 不会因为地址“依赖内存”就把整个访问归类为 indexed；slot-relative difference 仍可证明为 unit stride，因此 row load、scalar base update 和 `vle` 自然组成合法计划。
