@@ -74,7 +74,18 @@
 | :--- | :--- |
 | **[Triton TensorView 结构化张量视图机制](tensor-view-core-guide.md)** | SIMT 掩码寻址 vs 2D DMA 硬件动机、`make_tensor_view` 寻址几何与 `load_view` 读写解耦、ODS Builder 构造链、`TritonRaiseTensorView` 模式提升 Pass、DMA 描述符生成。 |
 
-## 阅读约定
+### 6. 编译器术语速查与概念参考
+
+| 文档名称 | 核心主题 |
+| :--- | :--- |
+| **[编译器与体系结构核心术语表](terminology.md)** | 通用概念持续沉淀索引：通道一致性与发散性模型（Uniform vs. Varying）、类型传染与类型毒化（Type Contagion / Poisoning）等。 |
+
+### 7. 技术写作哲学元规范
+
+| 文档名称 | 核心主题 |
+| :--- | :--- |
+| **[文档写作哲学](writing-philosophy.md)** | 全域写作的三维正交元模型（客体内容空间、模型本体阶阶、主体语用场）、叙事编译引擎（Kernel-Shell-Surface）与形式化自检门禁。 |
+
 
 1. **自包含性（Self-Containment）**：主文档内部专注于本篇主题，不设置跨文档相互跳转；
 2. **知识继承**：前序文档为后续文档的基础支撑（阅读 MLIR 核心理论前建议了解 C++ 基础机制；阅读 TensorView 前建议了解 MLIR 转换理论）。
